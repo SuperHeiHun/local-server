@@ -1,0 +1,44 @@
+# ---- \u6784\u5efa\u4ea7\u7269\uff1a\u7edd\u4e0d\u63d0\u4ea4 ----
+*.apk
+*.apks
+*.aab
+*.luac
+*.so
+*.dex
+
+# ---- \u7b7e\u540d\u4e0e\u5bc6\u94a5\uff1a\u7edd\u4e0d\u63d0\u4ea4 ----
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+id_rsa*
+xxtea*.json
+*secret*
+
+# ---- \u8fd0\u884c\u65f6\u4ea7\u7269 ----
+rt_assets.db
+*.db
+capture/
+srv.txt
+osrv.txt
+*.log
+
+# ---- \u4e34\u65f6\u811a\u672c\u4e0e\u53cc\u6392\u6587\u4ef6 ----
+*_aligned.apk
+_patched_src/
+_out_repack/
+_out_rrcp/
+_out_decompile/
+_out_text/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+
+# ---- \u7f16\u8f91\u5668 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store

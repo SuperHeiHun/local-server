@@ -1,0 +1,1707 @@
+{
+ "_syntax_gate": "The mock calls load_table() at startup and logs '!! 读表失败' on bad JSON, then falls back to an EMPTY table -- which looks like 'my edit did nothing'. Always run: python -c \"import json;json.load(open(r'E:\\Test\\Temp\\yqlr\\_out_rrcp\\opcodes_table.json',encoding='utf-8'))\" after editing this file. Beware: a trailing ',,' inside a _schema description string will corrupt the whole file.",
+ "_comment": "opcode -> response JSON. 'default' is the fallback for anything unlisted. Edit + restart the mock; no APK rebuild needed. resCode=0 = success; resCode!=0 && !=16001 pops Error_<resCode>. A string in 'data' is shown as a tip popup, so never put a string there on success.",
+ "_schema": {
+  "10001": "Login. NOTE the nesting: DevelopSystem:syncPlayer(response.data.player) is called with the PLAYER object, so `datas` lives INSIDE data.player, not as a sibling. Getting this wrong makes UnlockSystemListData silently ignored.",
+  "datas.HeroesData": "-> HeroModel:synchronize wants {heroes:{<CharacterId>:{...}}}. HeroBase:syncData only needs `next(data)` non-empty to set _owned=true; combat/starId/level/adv/exp/skills/finalProps are all optional. An EMPTY object per hero is enough to own it. IDs must exist in the Character config or DEBUG>0 asserts 'cannot find hero in local dataset'.",
+  "datas.Teams": "-> TeamsModel:synchronize wants {maxNum:N, teams:{...}}. _teamsMaxNum starts at 0 and is only raised when maxNum is present, which is why dispatch shows 0/1. NOTE TeamMediator:initMaxHeroNum does `tonumber(GridBattle.BattlePosition) or maxHero`, so the config value wins for a given stage -- GridBattle.BattlePosition=1 for Campaign_C00S01.",
+  "datas.UnlockSystemListData": "-> Unlock:synchronize wants {unlockSystemMap:{<systemId>:{...}}}. UnlockSystem:getChatServiceUnlock reads map.Friend_Main and does `data.real`, so Friend_Main must exist or it crashes with 'attempt to index local data'.",
+  "datas.TaskCenter": "-> TaskModel:synchronize wants {taskTypeMap:{<TaskCenterType>:{<taskId>:{taskId,taskState,beginCondition,targetValue}}}}. getMainTaskRedPoint runs on the main scene BEFORE the async task requests land, so MainTask must exist up front. Use {} per type: empty means no red dot, and it avoids TaskModelBase:initialize's assert on ConfigReader:requireRecordById('Task', id).",
+  "datas.FunctionListData": "optional, cheap, dispatches EVT_TASKCENTER_REDPOINT_REFRESH",
+  "datas.StairsBattleData": "-> LadderModel:synchronize wants {typeData:{<type>:{keepingHeroes:{},...}}, checkMaps:{}, todayReward:bool}. LadderSystem:getLadderOnHookHeroes does getLadderInfoForType('COMMON').keepingHeroes with NO nil guard, so ladderList.COMMON must exist or it crashes with 'attempt to index a nil value'. Reached from GuideSystem:checkAutoBattleFuncStatus (line 382) on every battle-failed screen, even with the guide overlay disabled -- the guide code path still executes.",
+  "PROBE_note": "Service:newRequest is patched with a cjson.encode nil-detector that dumps params and falls back to '{}'. If you never see [PROBE] lines in logcat, the request encoded fine and the crash was elsewhere.",
+  "player.level": "Keep this at 1. PlayerLevelSystem.initialize never calls initData(), so _oldLevel stays nil. checkPlayerLevelUp does `if self._oldLevel < self:getPlayerLevel()` -> 'attempt to compare nil with number'. The level only changes via an upgrade event that calls initData first, which our mock never triggers. Setting level high makes the very first settle crash; level 1 with no exp means the comparison never fires.",
+  "19002": "MailService mail list",
+  "10036": "story progress",
+  "10027": "guide step report (one request per guide step the client walks through)",
+  "13015": "seen after entering the tutorial stage",
+  "10021": "seen after entering the tutorial stage",
+  "41001": "sent right after login",
+  "unlock_all": "APK-side: GameConfigs.closeCheckUnlockSystem = true makes Unlock:getIsUnlock always return true. That does NOT cover getChatServiceUnlock, which reads unlockSystemMap directly."
+ },
+ "_taskTypes": [
+  "Limit",
+  "MainTask",
+  "StairsElementStage",
+  "DayTask",
+  "CollectLeapers",
+  "Ranking_Combat",
+  "Carnival",
+  "ActivityTask",
+  "AchievementTask",
+  "Guild",
+  "CarnivalInit",
+  "Ranking_WATER",
+  "Ranking_LIGHT",
+  "Ranking_EARTH",
+  "Ranking_WIND",
+  "Ranking_DARK",
+  "SevenDays",
+  "BattlePassWeekly",
+  "BattlePass",
+  "BattlePassDaily",
+  "StarField",
+  "Ranking_FIRE",
+  "Ranking_Stage",
+  "GuildScore"
+ ],
+ "_heroIds": {
+  "_note": "All 60 rowIds from the Character config. Unknown ids trip `assert(false, 'cannot find hero in local dataset')` when DEBUG>0. ShiZ is the friendly unit in Campaign_C00S01 (friend:C00S01_ShiZ).",
+  "all": [
+   "AnWZ",
+   "HuL",
+   "YingW",
+   "Mao",
+   "ChuanSJ",
+   "TeG",
+   "MoG",
+   "ZuanS",
+   "ZhangY",
+   "LaJ",
+   "WuG",
+   "Xiong",
+   "ChaiL",
+   "ShiZ",
+   "ShaY",
+   "Gou",
+   "PuGY",
+   "TianS",
+   "PiPX",
+   "KeXJ",
+   "YeTJS",
+   "BianSL",
+   "HuD",
+   "TuZ",
+   "EM",
+   "YuZSZ",
+   "ShengM",
+   "Ying",
+   "YouXJ",
+   "HuoL",
+   "WuY",
+   "He",
+   "BaiJ",
+   "ShiLM",
+   "ShuiX",
+   "KaoX",
+   "ErMD",
+   "She",
+   "BanJX",
+   "DianJT",
+   "WanO",
+   "XingJYM",
+   "RongY",
+   "CangS",
+   "BianF",
+   "DengP",
+   "JiXXZ",
+   "HuL_SP_01",
+   "MoG_SP_01",
+   "ShiLM_SP_01",
+   "ZhangY_SP_01",
+   "MiF",
+   "CaiH",
+   "DuJS",
+   "WuG_SP_01",
+   "Gou_SP_01",
+   "Xiong_SP_01",
+   "PuGY_SP_01",
+   "XiaoXX",
+   "HuoL_SP_01"
+  ]
+ },
+ "10001": {
+  "resCode": 0,
+  "data": {
+   "extra": {
+    "timeOffset": 0,
+    "serverOpenTime": 0,
+    "pauseTimeMax": 0,
+    "timeZone": 0
+   },
+   "player": {
+    "id": 100001,
+    "name": "Tester",
+    "level": 1,
+    "exp": 0,
+    "diamond": 999999,
+    "coin": 999999,
+    "lastOfflineTime": 0,
+    "unreadMailNum": 0,
+    "bag": {
+     "IR_Gold": {
+      "count": 999999,
+      "uniqId": ""
+     },
+     "IR_Diamond": {
+      "count": 99999,
+      "uniqId": ""
+     },
+     "IR_PlayerExp": {
+      "count": 0,
+      "uniqId": ""
+     },
+     "IR_CharExp": {
+      "count": 999999,
+      "uniqId": ""
+     },
+     "IM_GachaTicket": {
+      "count": 9999,
+      "uniqId": ""
+     }
+    },
+    "customData": {},
+    "datas": {
+     "UnlockSystemListData": {
+      "unlockSystemMap": {
+       "Hero_All": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Hero_Main": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Hero_LevelUp": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Hero_RankUp": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Hero_Upgrade": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Hero_Awaken": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Hero_Link": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Hero_Equip": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Hero_ExEquip": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Bag_All": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Bag_Item": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Bag_Equip": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Bag_Char": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Pause": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Campaign-Grope": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Campaign-Chapter": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Campaign-Stage": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Gacha_Main": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Gacha_Base": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Gacha_Race": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Story-Main": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Shop_main": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Village_Building": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Task_Camp": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "EquipmentZone": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Friend_Main": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "ChatNPC_Main": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Friend_fasong": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "AutoBattleBtn": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "SpeedUpTwoBtn": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "SpeedUpFourBtn": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Explore": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "PostTask": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_EARTH": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_WATER": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_WIND": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_FIRE": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_LIGHT": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_DARK": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Favorability": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "PrismCore": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Schedule": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Character_Reborn": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "periodRogueMainView": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "HomeLand": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Pay": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Team_Main": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Archive": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Team_Edit": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "EquipmentZone_Activity1": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "EquipmentZone_Activity2": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Maze": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Achievement": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "SignMonth": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "FriendLink": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "HomeLandGold": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "HomeLandGift": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "HomeLandExc": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "HomeLandSpeed": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "BattlePass": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "ACTIVITY_SUMMER": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Delete_Account_Android": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Delete_Account_Ios": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_Element": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_FIGHTER": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_MAGE": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_DEFENDER": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_SUPPORTER": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_MARKSMAN": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Stairs_ASSASIN": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Setting_System": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Social_System": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Activity_SeasonRouge": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "arenaEnter": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Arena": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Battlefield": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "BattlefieldFinal": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "StarField": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Chip": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Guild": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       },
+       "Ranking": {
+        "unlock": true,
+        "show": true,
+        "real": true
+       }
+      }
+     },
+     "TaskCenter": {
+      "taskTypeMap": {
+       "Limit": {},
+       "MainTask": {},
+       "StairsElementStage": {},
+       "DayTask": {},
+       "CollectLeapers": {},
+       "Ranking_Combat": {},
+       "Carnival": {},
+       "ActivityTask": {},
+       "AchievementTask": {},
+       "Guild": {},
+       "CarnivalInit": {},
+       "Ranking_WATER": {},
+       "Ranking_LIGHT": {},
+       "Ranking_EARTH": {},
+       "Ranking_WIND": {},
+       "Ranking_DARK": {},
+       "SevenDays": {},
+       "BattlePassWeekly": {},
+       "BattlePass": {},
+       "BattlePassDaily": {},
+       "StarField": {},
+       "Ranking_FIRE": {},
+       "Ranking_Stage": {},
+       "GuildScore": {}
+      }
+     },
+     "FunctionListData": {},
+     "CampaignData": {
+      "lastPassed": "C00S01",
+      "lastCampaign": "C00S01",
+      "lastBattleCampaign": "C00S01",
+      "branchLastPassed": {
+       "C00": "C00S01"
+      },
+      "campaignBranchUnlockTime": {},
+      "team": {},
+      "quickCountToday": 99,
+      "freeTimes": 99,
+      "leadSkills": {},
+      "quickRefreshTime": 0
+     },
+     "StairsBattleData": {
+      "typeData": {
+       "COMMON": {
+        "keepingHeroes": {
+         "LaJ": {
+          "uid": 1
+         }
+        },
+        "rank": 0,
+        "score": 0,
+        "todayReward": false,
+        "todayRewardGot": false
+       }
+      },
+      "checkMaps": {},
+      "todayReward": false
+     },
+     "HeroesData": {
+      "heroes": {
+       "LaJ": {
+        "level": 30,
+        "adv": 3,
+        "exp": 0,
+        "combat": 60000
+       },
+       "MoG": {
+        "adv": 1,
+        "combat": 60000,
+        "exp": 0,
+        "level": 30
+       },
+       "ChuanSJ": {
+        "adv": 1,
+        "combat": 60000,
+        "exp": 0,
+        "level": 30
+       },
+       "ShiZ": {
+        "adv": 1,
+        "combat": 60000,
+        "exp": 0,
+        "level": 30
+       }
+      },
+      "excEquipUnlock": {}
+     },
+     "Teams": {
+      "maxNum": 2,
+      "teams": {
+       "1": {
+        "name": "Team1",
+        "leadSkills": {},
+        "team": {}
+       },
+       "2": {
+        "name": "Team2",
+        "leadSkills": {},
+        "team": {}
+       },
+       "3": {
+        "name": "Team3",
+        "leadSkills": {},
+        "team": {}
+       },
+       "4": {
+        "name": "Team4",
+        "leadSkills": {},
+        "team": {}
+       },
+       "5": {
+        "name": "Team5",
+        "leadSkills": {},
+        "team": {}
+       },
+       "6": {
+        "name": "Team6",
+        "leadSkills": {},
+        "team": {}
+       }
+      }
+     },
+     "PlayerPay": {
+      "monthCards": {
+       "Pay_MonCard1": {
+        "expireTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        },
+        "isToday": false,
+        "receiveTime": 0,
+        "buyTime": 0,
+        "num": 0
+       },
+       "Pay_MonCard30": {
+        "expireTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        },
+        "isToday": false,
+        "receiveTime": 0,
+        "buyTime": 0,
+        "num": 0
+       },
+       "Pay_MonCard98": {
+        "expireTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        },
+        "isToday": false,
+        "receiveTime": 0,
+        "buyTime": 0,
+        "num": 0
+       },
+       "Pay_MonCard98_New": {
+        "expireTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        },
+        "isToday": false,
+        "receiveTime": 0,
+        "buyTime": 0,
+        "num": 0
+       }
+      },
+      "gifts": {
+       "ActivityBag_Free_CaiH": {
+        "giftId": "ActivityBag_Free_CaiH",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "ActivityBag_Free_MoG_SP_01": {
+        "giftId": "ActivityBag_Free_MoG_SP_01",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "ActivityBag_Free_ShiLM_SP_01": {
+        "giftId": "ActivityBag_Free_ShiLM_SP_01",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "ActivityBag_Free_WuG_SP_01": {
+        "giftId": "ActivityBag_Free_WuG_SP_01",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "ActivityBag_Free_XiaoXX": {
+        "giftId": "ActivityBag_Free_XiaoXX",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "ActivityBag_Free_YeTJS": {
+        "giftId": "ActivityBag_Free_YeTJS",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "ActivityBag_Free_ZhangY_SP_01": {
+        "giftId": "ActivityBag_Free_ZhangY_SP_01",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "DayBag_Supply": {
+        "giftId": "DayBag_Supply",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "Discounts_1": {
+        "giftId": "Discounts_1",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_1": {
+        "giftId": "VIPBag_Free_1",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_10": {
+        "giftId": "VIPBag_Free_10",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_11": {
+        "giftId": "VIPBag_Free_11",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_12": {
+        "giftId": "VIPBag_Free_12",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_13": {
+        "giftId": "VIPBag_Free_13",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_14": {
+        "giftId": "VIPBag_Free_14",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_15": {
+        "giftId": "VIPBag_Free_15",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_16": {
+        "giftId": "VIPBag_Free_16",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_17": {
+        "giftId": "VIPBag_Free_17",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_18": {
+        "giftId": "VIPBag_Free_18",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_2": {
+        "giftId": "VIPBag_Free_2",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_3": {
+        "giftId": "VIPBag_Free_3",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_4": {
+        "giftId": "VIPBag_Free_4",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_5": {
+        "giftId": "VIPBag_Free_5",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_6": {
+        "giftId": "VIPBag_Free_6",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_7": {
+        "giftId": "VIPBag_Free_7",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_8": {
+        "giftId": "VIPBag_Free_8",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       },
+       "VIPBag_Free_9": {
+        "giftId": "VIPBag_Free_9",
+        "buyNums": 1,
+        "unlockTime": 0,
+        "openCondition": {
+         "targetValue": 0,
+         "currentValue": 0
+        }
+       }
+      }
+     },
+     "ActivityData": {
+      "Activity_MainLineFund": {
+       "id": "Activity_MainLineFund",
+       "baseFundInfos": {}
+      },
+      "Activity_TowerFund": {
+       "id": "Activity_TowerFund",
+       "baseFundInfos": {}
+      },
+      "Activity_Deposit": {
+       "id": "Activity_Deposit"
+      }
+     },
+     "AchievementData": {
+      "typeMap": {
+       "History": {
+        "workings": {},
+        "finishMap": {},
+        "medals": {}
+       },
+       "Collection": {
+        "workings": {},
+        "finishMap": {},
+        "medals": {}
+       },
+       "Adventure": {
+        "workings": {},
+        "finishMap": {},
+        "medals": {}
+       }
+      },
+      "rewardLvs": {},
+      "point": 0,
+      "lv": 1
+     },
+     "PrismCoreData": {
+      "level": 0,
+      "star": 0,
+      "totalStar": 0,
+      "heroBeyond": {},
+      "categories": {
+       "FIRE": {
+        "branch": {
+         "order": 99,
+         "subOrder": 0,
+         "totalCost": 0,
+         "activeSkill": 0
+        }
+       },
+       "WIND": {
+        "branch": {
+         "order": 99,
+         "subOrder": 0,
+         "totalCost": 0,
+         "activeSkill": 0
+        }
+       },
+       "WATER": {
+        "branch": {
+         "order": 99,
+         "subOrder": 0,
+         "totalCost": 0,
+         "activeSkill": 0
+        }
+       },
+       "LIGHT": {
+        "branch": {
+         "order": 99,
+         "subOrder": 0,
+         "totalCost": 0,
+         "activeSkill": 0
+        }
+       },
+       "DARK": {
+        "branch": {
+         "order": 99,
+         "subOrder": 0,
+         "totalCost": 0,
+         "activeSkill": 0
+        }
+       },
+       "EARTH": {
+        "branch": {
+         "order": 99,
+         "subOrder": 0,
+         "totalCost": 0,
+         "activeSkill": 0
+        }
+       }
+      }
+     },
+     "GachaponData": {
+      "gachaponInfos": {
+       "Gacha_Base": {
+        "open": true,
+        "today": 0,
+        "ten": 0,
+        "total": 0
+       },
+       "Gacha_DoubleUp_S01": {
+        "open": true,
+        "today": 0,
+        "ten": 0,
+        "total": 0
+       },
+       "Gacha_DoubleUp_S02": {
+        "open": true,
+        "today": 0,
+        "ten": 0,
+        "total": 0
+       }
+      },
+      "cardRecordNums": {},
+      "totalTimes": 0,
+      "recordNum": 0
+     },
+     "PlayerClubData": {
+      "clubId": "",
+      "clubList": [],
+      "todayClubItemNum": 0,
+      "todayActive": false,
+      "lineUps": [],
+      "todayClubTaskNum": 0,
+      "weekClubTaskNum": 0
+     },
+     "ScheduleData": {
+      "dutyHero": {
+       "heroId": ""
+      },
+      "segmentMap": {},
+      "weatherMap": {},
+      "assistHeroMap": {},
+      "finishHeroMap": {},
+      "indexTotalMap": {},
+      "heroData": {
+       "heroId": "",
+       "resetTimes": 0
+      }
+     },
+     "MonthSignData": {
+      "num": 0,
+      "isToday": false,
+      "almanac": {
+       "event": "Fun_Birth128",
+       "tip": "SignMonthEvent_Fun_Birth_24",
+       "buff": "",
+       "reward": [],
+       "should": [
+        "SignMonthRandom_Should_1",
+        "SignMonthRandom_Should_2",
+        "SignMonthRandom_Should_3",
+        "SignMonthRandom_Should_5",
+        "SignMonthRandom_Should_6",
+        "SignMonthRandom_Should_7",
+        "SignMonthRandom_Should_8",
+        "SignMonthRandom_Should_9",
+        "SignMonthRandom_Should_10"
+       ],
+       "taboo": [
+        "SignMonthRandom_Taboo_1",
+        "SignMonthRandom_Taboo_2",
+        "SignMonthRandom_Taboo_3",
+        "SignMonthRandom_Taboo_4",
+        "SignMonthRandom_Taboo_5",
+        "SignMonthRandom_Taboo_6",
+        "SignMonthRandom_Taboo_7",
+        "SignMonthRandom_Taboo_8"
+       ],
+       "openCondition": {
+        "currentValue": 1,
+        "targetValue": 0
+       }
+      }
+     },
+     "VoiceData": {
+      "unlocked": {
+       "Unconditional": 1,
+       "BgStory_Favor_Mao_level3": 1,
+       "BgStory_Star_Mao_star5": 1,
+       "BgStory_Rank_Mao_rank10": 1,
+       "BgStory_Favor_Mao_level4": 1,
+       "BgStory_Favor_Mao_level1": 1,
+       "Function_unlock_Stage_C00S04": 1,
+       "BgStory_Favor_MoG_level3": 1,
+       "BgStory_Star_MoG_star5": 1,
+       "BgStory_Rank_MoG_rank10": 1,
+       "BgStory_Favor_MoG_level4": 1,
+       "BgStory_Favor_MoG_level1": 1,
+       "BgStory_Favor_WuG_level3": 1,
+       "BgStory_Star_WuG_star5": 1,
+       "BgStory_Rank_WuG_rank10": 1,
+       "BgStory_Favor_WuG_level4": 1,
+       "BgStory_Favor_WuG_level1": 1,
+       "BgStory_Favor_KeXJ_level3": 1,
+       "BgStory_Star_KeXJ_star5": 1,
+       "BgStory_Rank_KeXJ_rank10": 1,
+       "BgStory_Favor_KeXJ_level4": 1,
+       "BgStory_Favor_KeXJ_level1": 1,
+       "BgStory_Favor_ChuanSJ_level3": 1,
+       "BgStory_Star_ChuanSJ_star5": 1,
+       "BgStory_Rank_ChuanSJ_rank10": 1,
+       "BgStory_Favor_ChuanSJ_level4": 1,
+       "BgStory_Favor_ChuanSJ_level1": 1,
+       "BgStory_Favor_Xiong_level3": 1,
+       "BgStory_Star_Xiong_star5": 1,
+       "BgStory_Rank_Xiong_rank10": 1,
+       "BgStory_Favor_Xiong_level4": 1,
+       "BgStory_Favor_Xiong_level1": 1,
+       "BgStory_Favor_HuL_level3": 1,
+       "BgStory_Star_HuL_star5": 1,
+       "BgStory_Rank_HuL_rank10": 1,
+       "BgStory_Favor_HuL_level4": 1,
+       "BgStory_Favor_HuL_level1": 1,
+       "BgStory_Favor_Gou_level3": 1,
+       "BgStory_Star_Gou_star5": 1,
+       "BgStory_Rank_Gou_rank10": 1,
+       "BgStory_Favor_Gou_level4": 1,
+       "BgStory_Favor_Gou_level1": 1,
+       "BgStory_Favor_LaJ_level3": 1,
+       "BgStory_Star_LaJ_star5": 1,
+       "BgStory_Rank_LaJ_rank10": 1,
+       "BgStory_Favor_LaJ_level4": 1,
+       "BgStory_Favor_LaJ_level1": 1,
+       "BgStory_Favor_ShuiX_level3": 1,
+       "BgStory_Star_ShuiX_star5": 1,
+       "BgStory_Rank_ShuiX_rank10": 1,
+       "BgStory_Favor_ShuiX_level4": 1,
+       "BgStory_Favor_ShuiX_level1": 1,
+       "BgStory_Favor_ShengM_level3": 1,
+       "BgStory_Star_ShengM_star5": 1,
+       "BgStory_Rank_ShengM_rank10": 1,
+       "BgStory_Favor_ShengM_level4": 1,
+       "BgStory_Favor_ShengM_level1": 1,
+       "BgStory_Favor_YouXJ_level3": 1,
+       "BgStory_Star_YouXJ_star5": 1,
+       "BgStory_Rank_YouXJ_rank10": 1,
+       "BgStory_Favor_YouXJ_level4": 1,
+       "BgStory_Favor_YouXJ_level1": 1,
+       "BgStory_Favor_PiPX_level3": 1,
+       "BgStory_Star_PiPX_star5": 1,
+       "BgStory_Rank_PiPX_rank10": 1,
+       "BgStory_Favor_PiPX_level4": 1,
+       "BgStory_Favor_PiPX_level1": 1,
+       "BgStory_Favor_YingW_level3": 1,
+       "BgStory_Star_YingW_star5": 1,
+       "BgStory_Rank_YingW_rank10": 1,
+       "BgStory_Favor_YingW_level4": 1,
+       "BgStory_Favor_YingW_level1": 1,
+       "BgStory_Favor_PuGY_level3": 1,
+       "BgStory_Star_PuGY_star5": 1,
+       "BgStory_Rank_PuGY_rank10": 1,
+       "BgStory_Favor_PuGY_level4": 1,
+       "BgStory_Favor_PuGY_level1": 1,
+       "BgStory_Favor_ShiLM_level3": 1,
+       "BgStory_Star_ShiLM_star5": 1,
+       "BgStory_Rank_ShiLM_rank10": 1,
+       "BgStory_Favor_ShiLM_level4": 1,
+       "BgStory_Favor_ShiLM_level1": 1,
+       "BgStory_Favor_TuZ_level3": 1,
+       "BgStory_Star_TuZ_star5": 1,
+       "BgStory_Rank_TuZ_rank10": 1,
+       "BgStory_Favor_TuZ_level4": 1,
+       "BgStory_Favor_TuZ_level1": 1,
+       "BgStory_Favor_AnWZ_level3": 1,
+       "BgStory_Star_AnWZ_star5": 1,
+       "BgStory_Rank_AnWZ_rank10": 1,
+       "BgStory_Favor_AnWZ_level4": 1,
+       "BgStory_Favor_AnWZ_level1": 1,
+       "BgStory_Favor_ZuanS_level3": 1,
+       "BgStory_Star_ZuanS_star5": 1,
+       "BgStory_Rank_ZuanS_rank10": 1,
+       "BgStory_Favor_ZuanS_level4": 1,
+       "BgStory_Favor_ZuanS_level1": 1,
+       "BgStory_Favor_TeG_level3": 1,
+       "BgStory_Star_TeG_star5": 1,
+       "BgStory_Rank_TeG_rank10": 1,
+       "BgStory_Favor_TeG_level4": 1,
+       "BgStory_Favor_TeG_level1": 1,
+       "BgStory_Favor_ShiZ_level3": 1,
+       "BgStory_Star_ShiZ_star5": 1,
+       "BgStory_Rank_ShiZ_rank10": 1,
+       "BgStory_Favor_ShiZ_level4": 1,
+       "BgStory_Favor_ShiZ_level1": 1,
+       "BgStory_Favor_TianS_level3": 1,
+       "BgStory_Star_TianS_star5": 1,
+       "BgStory_Rank_TianS_rank10": 1,
+       "BgStory_Favor_TianS_level4": 1,
+       "BgStory_Favor_TianS_level1": 1,
+       "BgStory_Favor_ChaiL_level3": 1,
+       "BgStory_Star_ChaiL_star5": 1,
+       "BgStory_Rank_ChaiL_rank10": 1,
+       "BgStory_Favor_ChaiL_level4": 1,
+       "BgStory_Favor_ChaiL_level1": 1,
+       "BgStory_Favor_ShaY_level3": 1,
+       "BgStory_Star_ShaY_star5": 1,
+       "BgStory_Rank_ShaY_rank10": 1,
+       "BgStory_Favor_ShaY_level4": 1,
+       "BgStory_Favor_ShaY_level1": 1,
+       "BgStory_Favor_ZhangY_level3": 1,
+       "BgStory_Star_ZhangY_star5": 1,
+       "BgStory_Rank_ZhangY_rank10": 1,
+       "BgStory_Favor_ZhangY_level4": 1,
+       "BgStory_Favor_ZhangY_level1": 1,
+       "BgStory_Favor_Ying_level3": 1,
+       "BgStory_Star_Ying_star5": 1,
+       "BgStory_Rank_Ying_rank10": 1,
+       "BgStory_Favor_Ying_level4": 1,
+       "BgStory_Favor_Ying_level1": 1,
+       "BgStory_Favor_KaoX_level3": 1,
+       "BgStory_Star_KaoX_star5": 1,
+       "BgStory_Rank_KaoX_rank10": 1,
+       "BgStory_Favor_KaoX_level4": 1,
+       "BgStory_Favor_KaoX_level1": 1,
+       "BgStory_Favor_YeTJS_level3": 1,
+       "BgStory_Star_YeTJS_star5": 1,
+       "BgStory_Rank_YeTJS_rank10": 1,
+       "BgStory_Favor_YeTJS_level4": 1,
+       "BgStory_Favor_YeTJS_level1": 1,
+       "BgStory_Favor_BaiJ_level3": 1,
+       "BgStory_Star_BaiJ_star5": 1,
+       "BgStory_Rank_BaiJ_rank10": 1,
+       "BgStory_Favor_BaiJ_level4": 1,
+       "BgStory_Favor_BaiJ_level1": 1,
+       "BgStory_Favor_YuZSZ_level3": 1,
+       "BgStory_Star_YuZSZ_star5": 1,
+       "BgStory_Rank_YuZSZ_rank10": 1,
+       "BgStory_Favor_YuZSZ_level4": 1,
+       "BgStory_Favor_YuZSZ_level1": 1,
+       "BgStory_Favor_HuD_level3": 1,
+       "BgStory_Star_HuD_star5": 1,
+       "BgStory_Rank_HuD_rank10": 1,
+       "BgStory_Favor_HuD_level4": 1,
+       "BgStory_Favor_HuD_level1": 1,
+       "BgStory_Favor_EM_level3": 1,
+       "BgStory_Star_EM_star5": 1,
+       "BgStory_Rank_EM_rank10": 1,
+       "BgStory_Favor_EM_level4": 1,
+       "BgStory_Favor_EM_level1": 1,
+       "BgStory_Favor_ErMD_level3": 1,
+       "BgStory_Star_ErMD_star5": 1,
+       "BgStory_Rank_ErMD_rank10": 1,
+       "BgStory_Favor_ErMD_level4": 1,
+       "BgStory_Favor_ErMD_level1": 1,
+       "BgStory_Favor_He_level3": 1,
+       "BgStory_Favor_He_level4": 1,
+       "BgStory_Favor_He_level1": 1,
+       "BgStory_Rank_He_rank10": 1,
+       "BgStory_Star_He_star5": 1,
+       "BgStory_Favor_WuY_level3": 1,
+       "BgStory_Favor_WuY_level4": 1,
+       "BgStory_Favor_WuY_level1": 1,
+       "BgStory_Rank_WuY_rank10": 1,
+       "BgStory_Star_WuY_star5": 1,
+       "BgStory_Favor_HuoL_level3": 1,
+       "BgStory_Favor_HuoL_level4": 1,
+       "BgStory_Favor_HuoL_level1": 1,
+       "BgStory_Rank_HuoL_rank10": 1,
+       "BgStory_Star_HuoL_star5": 1,
+       "BgStory_Favor_She_level3": 1,
+       "BgStory_Star_She_star5": 1,
+       "BgStory_Rank_She_rank10": 1,
+       "BgStory_Favor_She_level4": 1,
+       "BgStory_Favor_She_level1": 1,
+       "BgStory_Favor_BianSL_level3": 1,
+       "BgStory_Favor_BianSL_level4": 1,
+       "BgStory_Favor_BianSL_level1": 1,
+       "BgStory_Rank_BianSL_rank10": 1,
+       "BgStory_Star_BianSL_star5": 1,
+       "BgStory_Favor_DianJT_level3": 1,
+       "BgStory_Favor_DianJT_level4": 1,
+       "BgStory_Favor_DianJT_level1": 1,
+       "BgStory_Rank_DianJT_rank10": 1,
+       "BgStory_Star_DianJT_star5": 1,
+       "BgStory_Favor_BanJX_level3": 1,
+       "BgStory_Favor_BanJX_level1": 1,
+       "BgStory_Rank_BanJX_rank10": 1,
+       "BgStory_Star_BanJX_star5": 1,
+       "BgStory_Favor_WanO_level3": 1,
+       "BgStory_Favor_WanO_level4": 1,
+       "BgStory_Favor_WanO_level1": 1,
+       "BgStory_Rank_WanO_rank10": 1,
+       "BgStory_Star_WanO_star5": 1,
+       "BgStory_Favor_XingJYM_level3": 1,
+       "BgStory_Favor_XingJYM_level4": 1,
+       "BgStory_Favor_XingJYM_level1": 1,
+       "BgStory_Rank_XingJYM_rank10": 1,
+       "BgStory_Star_XingJYM_star5": 1,
+       "BgStory_Favor_RongY_level3": 1,
+       "BgStory_Star_RongY_star5": 1,
+       "BgStory_Rank_RongY_rank10": 1,
+       "BgStory_Favor_RongY_level4": 1,
+       "BgStory_Favor_RongY_level1": 1,
+       "BgStory_Favor_BianF_level3": 1,
+       "BgStory_Star_BianF_star5": 1,
+       "BgStory_Rank_BianF_rank10": 1,
+       "BgStory_Favor_BianF_level4": 1,
+       "BgStory_Favor_BianF_level1": 1,
+       "BgStory_Favor_CangS_level3": 1,
+       "BgStory_Favor_CangS_level4": 1,
+       "BgStory_Favor_CangS_level1": 1,
+       "BgStory_Rank_CangS_rank10": 1,
+       "BgStory_Star_CangS_star5": 1,
+       "BgStory_Favor_DengP_level3": 1,
+       "BgStory_Favor_DengP_level4": 1,
+       "BgStory_Favor_DengP_level1": 1,
+       "BgStory_Rank_DengP_rank10": 1,
+       "BgStory_Star_DengP_star5": 1,
+       "BgStory_Favor_JiXXZ_level3": 1,
+       "BgStory_Star_JiXXZ_star5": 1,
+       "BgStory_Rank_JiXXZ_rank10": 1,
+       "BgStory_Favor_JiXXZ_level4": 1,
+       "BgStory_Favor_JiXXZ_level1": 1,
+       "BgStory_Favor_HuL_SP_01_level3": 1,
+       "BgStory_Star_HuL_SP_01_star5": 1,
+       "BgStory_Rank_HuL_SP_01_rank10": 1,
+       "BgStory_Favor_HuL_SP_01_level4": 1,
+       "BgStory_Favor_HuL_SP_01_level1": 1,
+       "BgStory_Favor_MoG_SP_01_level3": 1,
+       "BgStory_Star_MoG_SP_01_star5": 1,
+       "BgStory_Rank_MoG_SP_01_rank10": 1,
+       "BgStory_Favor_MoG_SP_01_level4": 1,
+       "BgStory_Favor_MoG_SP_01_level1": 1,
+       "BgStory_Favor_ShiLM_SP_01_level3": 1,
+       "BgStory_Star_ShiLM_SP_01_star5": 1,
+       "BgStory_Rank_ShiLM_SP_01_rank10": 1,
+       "BgStory_Favor_ShiLM_SP_01_level4": 1,
+       "BgStory_Favor_ShiLM_SP_01_level1": 1,
+       "BgStory_Favor_ZhangY_SP_01_level3": 1,
+       "BgStory_Star_ZhangY_SP_01_star5": 1,
+       "BgStory_Rank_ZhangY_SP_01_rank10": 1,
+       "BgStory_Favor_ZhangY_SP_01_level4": 1,
+       "BgStory_Favor_ZhangY_SP_01_level1": 1,
+       "BgStory_Favor_MiF_level3": 1,
+       "BgStory_Star_MiF_star5": 1,
+       "BgStory_Rank_MiF_rank10": 1,
+       "BgStory_Favor_MiF_level4": 1,
+       "BgStory_Favor_MiF_level1": 1,
+       "BgStory_Favor_Gou_SP_01_level4": 1,
+       "BgStory_Rank_Gou_SP_01_rank10": 1,
+       "BgStory_Star_Gou_SP_01_star5": 1,
+       "BgStory_Favor_PuGY_SP_01_level4": 1,
+       "BgStory_Rank_PuGY_SP_01_rank10": 1,
+       "BgStory_Star_PuGY_SP_01_star5": 1,
+       "BgStory_Favor_WuG_SP_01_level4": 1,
+       "BgStory_Rank_WuG_SP_01_rank10": 1,
+       "BgStory_Star_WuG_SP_01_star5": 1,
+       "BgStory_Favor_Xiong_SP_01_level4": 1,
+       "BgStory_Rank_Xiong_SP_01_rank10": 1,
+       "BgStory_Star_Xiong_SP_01_star5": 1,
+       "BgStory_Favor_Gou_SP_01_level3": 1,
+       "BgStory_Favor_Gou_SP_01_level1": 1,
+       "BgStory_Favor_CaiH_level3": 1,
+       "BgStory_Favor_CaiH_level4": 1,
+       "BgStory_Favor_CaiH_level1": 1,
+       "BgStory_Rank_CaiH_rank10": 1,
+       "BgStory_Star_CaiH_star5": 1,
+       "BgStory_Favor_DuJS_level3": 1,
+       "BgStory_Favor_DuJS_level4": 1,
+       "BgStory_Favor_DuJS_level1": 1,
+       "BgStory_Rank_DuJS_rank10": 1,
+       "BgStory_Star_DuJS_star5": 1,
+       "BgStory_Favor_XiaoXX_level3": 1,
+       "BgStory_Star_XiaoXX_star5": 1,
+       "BgStory_Rank_XiaoXX_rank10": 1,
+       "BgStory_Favor_XiaoXX_level4": 1,
+       "BgStory_Favor_XiaoXX_level1": 1,
+       "BgStory_Star_HuoL_SP_01_star5": 1,
+       "BgStory_Rank_HuoL_SP_01_rank10": 1,
+       "BgStory_Favor_HuoL_SP_01_level4": 1,
+       "BgStory_Favor_HuoL_SP_01_level1": 1
+      }
+     },
+     "ChipBag": {
+      "chips": {}
+     }
+    },
+    "createTime": 0,
+    "lastLoginTime": 0,
+    "vipExp": 0,
+    "combat": 0,
+    "city": "",
+    "mainScreenHeroId": "LaJ",
+    "mainScreenType": "Por_Spine",
+    "nameCard": "",
+    "avatar": "",
+    "headBox": "",
+    "loginDays": 0,
+    "heroShow": {},
+    "todayOnlineTime": 0,
+    "lastForeground": 0,
+    "totalMoney": 0,
+    "headFrames": {},
+    "vipLevel": 0,
+    "gender": 0,
+    "birthday": "",
+    "signature": ""
+   },
+   "customData": {}
+  }
+ },
+ "14002": {
+  "resCode": 0,
+  "data": {
+   "campaignId": "C00S01",
+   "gridBattleId": "Campaign_C00S01",
+   "logicSeed": 123456,
+   "param": {
+    "repeatedDefeats": 0
+   },
+   "playerData": {
+    "rid": 100001,
+    "uid": 100001,
+    "totalCombat": 60000,
+    "heros": [
+     {
+      "uid": "100001_1",
+      "cid": "LaJ",
+      "modelId": "C_LaJ",
+      "camp": 1,
+      "x": 2,
+      "y": 3,
+      "level": 30,
+      "star": 5,
+      "adv": 3,
+      "element": "FIRE",
+      "profession": "MAGE",
+      "Weight": 1000,
+      "combat": 60000,
+      "skills": {
+       "LaJ_S1_B": 5,
+       "LaJ_U_B": 5,
+       "LaJ_C_B": 5
+      },
+      "attrs": {
+       "MaxHP": 60000,
+       "Atk": 9000,
+       "PDef": 3000,
+       "MDef": 3000,
+       "MaxMP": 5000,
+       "CriDmg": 15000,
+       "BlkDmg": 9000
+      }
+     }
+    ]
+   },
+   "enemyData": {
+    "uid": 200001,
+    "rid": 200001,
+    "totalCombat": 4500,
+    "heros": [
+     {
+      "uid": "200001_1",
+      "cid": "C00S01_DEF",
+      "modelId": "C_DiTK",
+      "camp": 2,
+      "x": 4,
+      "y": 3,
+      "level": 1,
+      "star": 1,
+      "element": "EARTH",
+      "profession": "DEFENDER",
+      "Weight": 1000,
+      "combat": 1000,
+      "skills": {
+       "EarthDefender_S1_B": 1,
+       "EarthDefender_U_B": 1,
+       "EarthDefender_C_B": 1
+      },
+      "attrs": {
+       "MaxHP": 3000,
+       "Atk": 300,
+       "PDef": 200,
+       "MDef": 200,
+       "MaxMP": 1000
+      }
+     },
+     {
+      "uid": "200001_2",
+      "cid": "C00S01_MAR",
+      "modelId": "C_DiSS",
+      "camp": 2,
+      "x": 6,
+      "y": 3,
+      "level": 1,
+      "star": 1,
+      "element": "EARTH",
+      "profession": "MARKSMAN",
+      "Weight": 1000,
+      "combat": 1500,
+      "skills": {
+       "EarthMarksman_S1_B": 1,
+       "EarthMarksman_U_B": 1,
+       "EarthMarksman_C_B": 1
+      },
+      "attrs": {
+       "MaxHP": 2500,
+       "Atk": 250,
+       "PDef": 150,
+       "MDef": 150,
+       "MaxMP": 1000
+      }
+     },
+     {
+      "uid": "200001_3",
+      "cid": "C00S01_MAG",
+      "modelId": "C_DiFS",
+      "camp": 2,
+      "x": 5,
+      "y": 3,
+      "level": 1,
+      "star": 1,
+      "element": "EARTH",
+      "profession": "MAGE",
+      "Weight": 1000,
+      "combat": 2000,
+      "skills": {
+       "EarthMage_S1_B": 1,
+       "EarthMage_U_B": 1,
+       "EarthMage_C_B": 1
+      },
+      "attrs": {
+       "MaxHP": 2500,
+       "Atk": 250,
+       "PDef": 150,
+       "MDef": 150,
+       "MaxMP": 1000
+      }
+     }
+    ]
+   }
+  }
+ },
+ "datas.ActivityData": "-> DevelopSystem:262 `otherDatas.ActivityData.activities` -> ActivityList:synchronize. ActivityList:getActivityById asserts `activity ~= nil, 'not find activity by Id:'..id` with NO guard, so PayShopSystem / ActivitySystem asking for e.g. Activity_MainLineFund crashes the main-scene red-point check. Shape is a map keyed by activity id.",
+ "14003.data.passReward": "-> BattleSuccessMediator:initView does `local rewards = data.rewards or {}` (view param) which requestLeaveBattle fills from responseData.passReward, then RewardSystem:parseRewardInfo per entry. parseRewardInfo accepts either {id,count,type,uniqId,quality} directly, or {code,amount} and calls _parseInfo. Filter at line 246 skips type=='ITEM' with count==0. Item ids verified against Item.tsv (451 rows).",
+ "14001": {
+  "resCode": 0,
+  "data": {}
+ },
+ "14003": {
+  "resCode": 0,
+  "data": {
+   "pass": true,
+   "firstPass": true,
+   "withdraw": false,
+   "reviewFailed": false,
+   "passReward": [
+    {
+     "id": "IR_Gold",
+     "count": 50000,
+     "type": "ITEM",
+     "uniqId": "",
+     "quality": 3
+    },
+    {
+     "id": "IR_Diamond",
+     "count": 5000,
+     "type": "ITEM",
+     "uniqId": "",
+     "quality": 4
+    },
+    {
+     "id": "IR_PlayerExp",
+     "count": 10000,
+     "type": "ITEM",
+     "uniqId": "",
+     "quality": 3
+    },
+    {
+     "id": "IR_CharExp",
+     "count": 10000,
+     "type": "ITEM",
+     "uniqId": "",
+     "quality": 3
+    }
+   ],
+   "datas": {}
+  }
+ },
+ "14009": {
+  "resCode": 0,
+  "data": {}
+ },
+ "14016": {
+  "resCode": 0,
+  "data": {}
+ },
+ "10010": {
+  "resCode": 0,
+  "data": {}
+ },
+ "19002": {
+  "resCode": 0,
+  "data": {
+   "list": [],
+   "mailList": []
+  }
+ },
+ "10036": {
+  "resCode": 0,
+  "data": {}
+ },
+ "10027": {
+  "resCode": 0,
+  "data": {}
+ },
+ "13015": {
+  "resCode": 0,
+  "data": {}
+ },
+ "10021": {
+  "resCode": 0,
+  "data": {}
+ },
+ "41001": {
+  "resCode": 0,
+  "data": {}
+ },
+ "default": {
+  "resCode": 0,
+  "data": {}
+ }
+}

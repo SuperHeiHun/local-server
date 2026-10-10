@@ -130,24 +130,19 @@
     "unreadMailNum": 0,
     "bag": {
      "IR_Gold": {
-      "count": 999999,
-      "uniqId": ""
+      "count": 999999
      },
      "IR_Diamond": {
-      "count": 99999,
-      "uniqId": ""
+      "count": 99999
      },
      "IR_PlayerExp": {
-      "count": 0,
-      "uniqId": ""
+      "count": 0
      },
      "IR_CharExp": {
-      "count": 999999,
-      "uniqId": ""
+      "count": 999999
      },
      "IM_GachaTicket": {
-      "count": 9999,
-      "uniqId": ""
+      "count": 9999
      }
     },
     "customData": {},

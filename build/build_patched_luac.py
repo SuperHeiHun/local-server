@@ -73,8 +73,15 @@ PROBE_FNS = (
 )
 
 # 整个文件都是探针的 patcher：release 直接不编译、不替换
+#
+# 【2026-10-10 变更】dmAudio 已移出这个集合。
+# 它原本只是配音探针（`_ap_probe`），但现在还带了**功能性改动**：
+# 把中文语音指向公共目录 /storage/emulated/0/yqlr/（见 patch_dmaudio）。
+# 原包里根本没有 cn 语音（MEMORY 33.1：db 有 240 条，APK 命中 0），
+# 这个改动是中文配音能播的唯一原因，release 必须带上。
+# 探针 I/O 由 PROBE_FNS 那套机制单独关掉（release 里 `_ap_probe` 变空实现），
+# 不需要靠"整个文件不编译"来屏蔽。
 DEV_ONLY_LOGICS = {
-    'yq/assets/dmAudio.luac',
     'yq/gameplay/hero/view/HeroInfoMediator.luac',
 }
 
@@ -91,9 +98,29 @@ JOBS = [
     dict(logic='yq/gameplay/activity/model/ActivityList.luac',
          src=r'D:\Temp\yqlr\_out_decompile\lua\yq\gameplay\activity\model\ActivityList.lua',
          tagpath='assets/release/e8/f5/de01a786648ab72d0386fa87555f.luac'),
+    dict(logic='yq/debug/debugBox/view/DebugModule.luac',
+         src=r'E:\Test\Temp\yqlr\_out_decompile\lua\yq\debug\debugBox\view\DebugModule.lua',
+         tagpath='assets/release/86/50/8af682cce54de9ebc28c9b83cf22.luac'),
+    # [YQLR] 服务端配置页。tagpath 由原始 .luac 的 md5 推导：
+    #   md5(解密后的 DebugBoxMediator.luac) = 194ae4c12dff063e90fa5e65476807b4
+    #   -> release/19/4a/e4c12dff063e90fa5e65476807b4.luac
+    # 已与设备上运行时 assets.db 的 real 字段核对一致。
+    dict(logic='yq/gameplay/site/view/SiteGamePageWidget.luac',
+         src=r'E:\Test\Temp\yqlr\_out_decompile\lua\yq\gameplay\site\view\SiteGamePageWidget.lua',
+         tagpath='assets/release/19/15/19424521a05635353cc60752e027.luac'),
+    dict(logic='yq/debug/debugBox/view/DebugBoxMediator.luac',
+         src=r'E:\Test\Temp\yqlr\_out_decompile\lua\yq\debug\debugBox\view\DebugBoxMediator.lua',
+         tagpath='assets/release/19/4a/e4c12dff063e90fa5e65476807b4.luac'),
+    dict(logic='yq/gameplay/base/UrlEntry.luac',
+         src=r'E:\Test\Temp\yqlr\_out_decompile\lua\yq\gameplay\base\UrlEntry.lua',
+         tagpath='assets/release/75/44/3109cc358b2b319c834ae573f1c5.luac'),
     dict(logic='yq/gameplay/stage/view/BattleSuccessMediator.luac',
          src=r'D:\Temp\yqlr\_out_decompile\lua\yq\gameplay\stage\view\BattleSuccessMediator.lua',
          tagpath='assets/release/50/6d/cde3d25404075daddf83fa767a56.luac'),
+    dict(logic='yq/gameplay/home/view/HomeCenterWidget.luac',
+         # 完整反编译在 E 盘；D:\Temp\yqlr\_out_decompile 只有被补丁过的那十几个文件
+         src=r'E:\Test\Temp\yqlr\_out_decompile\lua\yq\gameplay\home\view\HomeCenterWidget.lua',
+         tagpath='assets/release/1f/a7/51a02b6900d06deadbfb61eb4057.luac'),
     dict(logic='yq/gameplay/playerLevel/controller/PlayerLevelSystem.luac',
          src=r'D:\Temp\yqlr\_out_decompile\lua\yq\gameplay\playerLevel\controller\PlayerLevelSystem.lua',
          tagpath='assets/release/40/eb/a7efc0f60158afa3f30e87c90145.luac'),
@@ -414,9 +441,14 @@ def patch_service(src, _c):
     #   client fail to unwrap).
     #   Watch file: /sdcard/osrv.txt
     #
-    # dev profile only for now; enable on release once RSA + responses land.
+    # 曾经只在 dev profile 注入（注释写着 "enable on release once RSA +
+    # responses land"）。现在应答层已经补齐并通过 test_rsp_offline.py
+    # 离线验证（10001 / 10032 / 10038 / 21001 / 21002 / 21005 / 29001），
+    # 所以 release（RL）profile 也要能内嵌服务端 —— RL 版的用途正是
+    # 不依赖 PC 上的 Python mock 独立跑。
+    # 开关仍保留 YQLR_OSRV=0 用于出"不带服务端"的包。
     # ------------------------------------------------------------------
-    if IS_DEV and os.environ.get('YQLR_OSRV', '1') == '1':
+    if os.environ.get('YQLR_OSRV', '1') == '1':
         _lua_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lua')
         _srv_path = os.path.join(_lua_dir, 'offline_server.lua')
         _srv_src = io.open(_srv_path, encoding='utf-8').read()
@@ -545,6 +577,816 @@ def patch_activitylist(src, _c):
     assert cnt2 == 1, 'syncAloneActivity 的 requireRecordById 未唯一匹配（命中 %d 次）' % cnt2
     src = src.replace(OLD2, NEW2)
     print('    syncAloneActivity -> requireRecordById 改 getRecordById')
+
+    # [YQLR] 注入调试活动 Activity_Debug_Config 的**配置行**。
+    #
+    # 为什么要注入：syncAloneActivity 拿 id 去 ConfigReader 查 Activity 表，
+    # 查不到就走 `if config then` —— 整条活动被**静默丢弃**。
+    # 所以光让服务端在 datas.ActivityData 里下发
+    # Activity_Debug_Config 是不够的，客户端这边必须先有这一行。
+    #
+    # 注入点选在这里（而不是 ConfigReader）是因为 ActivityList 已经在补丁
+    # 清单里，改它不需要新增资源条目；ConfigReader 是全局热点，不去碰。
+    #
+    # ConfigReader._Tables 就是普通 Lua 表（ConfigReader.lua:125
+    # `return dataTable and dataTable[id]`），可以安全塞一行。
+    # Type=Meaningless 走 MeaninglessModel，它只是 BaseActivity 的空壳
+    # （MeaninglessModel.lua 只有 initialize/synchronize 两个方法），
+    # 不会像别的 Type 那样去读一堆没下发的子表。
+    if os.environ.get('YQLR_DEBUG_ACTIVITY', '1') == '1':
+        OLD3 = '\t\tlocal config = ConfigReader:getRecordById("Activity", id)\n\n\t\tif config then\n'
+        NEW3 = (
+            '\t\t-- [YQLR] 服务端会下发 Activity_Debug_Config（调试面板入口），\n'
+            '\t\t-- 但 Activity 配置表里没有这一行，syncAloneActivity 会静默丢弃。\n'
+            '\t\t-- 这里按需注入一行（Idempotent：已存在就不覆盖）。\n'
+            '\t\tif id == "Activity_Debug_Config" then\n'
+            '\t\t\tself:ensureDebugActivityConfig()\n'
+            '\t\tend\n\n'
+            '\t\tlocal config = ConfigReader:getRecordById("Activity", id)\n\n'
+            '\t\tif config then\n')
+        cnt3 = src.count(OLD3)
+        assert cnt3 == 1, '注入点未唯一匹配（命中 %d 次）' % cnt3
+        src = src.replace(OLD3, NEW3)
+
+        # ensureDebugActivityConfig：往 ConfigReader 的 Activity 表塞一行。
+        # Link 指向 DebugBoxView（modules.lua:192-193 注册了
+        # DebugBoxView + DebugBoxMediator），点活动就走
+        # ActivityMediator:104 -> enterViewByUrl(cfg.Link) 打开调试面板。
+        ANCHOR = 'function ActivityList:syncAloneActivity(id, data)\n'
+        assert src.count(ANCHOR) == 1, 'syncAloneActivity 定义未唯一匹配'
+        INJECT = '''-- [YQLR] 调试活动配置行。
+--
+-- **必须写 DataReader 的缓存表，不能写 ConfigReader:getDataTable() 的返回值。**
+-- 原因（踩了两轮才搞清楚）：
+--   ConfigReader.lua:14  isUseDBReader = true
+--   => ConfigReader:getRecordById/getDataTable 全部转发给 DataReader
+--   DataReader:getDataTable(:138-152) 每次调用都 **新建一个 temp 表**
+--      （还要过一遍 `if value ~= false` 过滤），返回的是**临时副本**
+--   => 往它的返回值里写 tbl[id] = ...，下一次读时拿到的是另一个副本，写入丢失
+--
+-- DataReader 真正的持久层是 `_cacheDataTable`（:98-120）：
+--   _getRecordById 先查 _cacheDataTable[tableName][id]，
+--   查不到才去读 DB，而且**查不到时会写 false 进去缓存**（:110-112）。
+-- 所以要绕过 ConfigReader，直接把记录塞进 DataReader._cacheDataTable，
+-- 同时把可能已缓存的 false 覆盖掉。
+--
+-- 字段含义对齐 Activity.tsv 的同名列。
+function ActivityList:ensureDebugActivityConfig()
+\tlocal id = "Activity_Debug_Config"
+
+\t-- 幂等标记。用全局而不是 local：upvalue 需要在函数外先声明，
+\t-- 这里直接用全局最省事（一个进程里注入一次足够）。
+\tif _yqlrDebugConfigInjected == true then
+\t\treturn
+\tend
+
+\tlocal row = {
+\t\trowId = id,
+\t\tId = id,
+\t\tType = "Meaningless",
+\t\tConfig = {},
+\t\tName = "服务端配置",
+\t\tDescribe = "离线服调试面板：改服务端配置",
+\t\t-- **Icon 必须有 Icon[1].ListRes**，否则这个活动不会出现在
+\t\t-- 「限时活动」弹窗里。链路：
+\t\t--   BannerSystem:50      activityCfg.Icon ~= ""   -> 空串被挡
+\t\t--   ActivityMediator:100 icon:setURL(kBannerIcon
+\t\t--                       .. cfg.icon[1].ListRes .. ".png")
+\t\t-- 这个弹窗是**唯一**的活动列表，不存在另一条不依赖 Icon 的显示路径。
+\t\t-- 复用 main_show_19_m（与 Activity_Limit_100Gacha 同图，
+\t\t-- 已确认 asset/lang_banner/main_show_19_m.png 存在）。
+\t\tIcon = {
+\t\t\t{
+\t\t\t\tListRes = "main_show_19_m"
+\t\t\t}
+\t\t},
+\t\tOrder = 999,
+\t\t-- 直接开**游戏设置页**：配置项已经由
+\t\t-- patch_sitegamepagewidget 追加进 SiteGamePageWidget 的
+\t\t-- getSiteGameData()，走游戏自己的 initSiteList 渲染。
+\t\t-- 不再走 DebugBox —— 那是无美术的开发面板（标题就是
+\t\t-- "What's your dream?"），和游戏的正式界面不像。
+\t\t-- type=siteGame 切到「游戏设置」那一页（FunctionUnlock.tsv 里
+\t\t-- Setting_System 的 Link 就是这个值）。
+\t\tLink = "view://siteMainView&viewType=push&type=siteGame",
+\t\t-- else 分支里，viewType 为空就静默返回（现象：弹窗关了、没反应、
+\t\t-- 也不报错）；取值 switch/push/popup 分别对应
+\t\t-- EVT_SWITCH_VIEW / EVT_PUSH_VIEW / EVT_SHOW_POPUP。
+\t\t-- 但**不能用 popup**：
+\t\t--   DebugBoxMediator 继承 DmAreaViewMediator（区域视图），
+\t\t--   不是 DmPopupViewMediator。走 EVT_SHOW_POPUP 会进
+\t\t--   PopupViewGroup.lua:199-202：
+\t\t--     local mediator = self:getMediatorMap():retrieveMediator(popupView)
+\t\t--     mediator:setPopupDelegate(delegate)
+\t\t--   retrieveMediator（MediatorMap.lua:165-171）按 view 实例反查，
+\t\t--   对区域视图 mediator 查不到带 setPopupDelegate 的那个，于是
+\t\t--   "PopupViewGroup.lua:182: attempt to call method
+\t\t--    'setPopupDelegate' (a nil value)"。
+\t\t-- 而且客户端里所有 view:// 链接实测**只用 viewType=push**
+\t\t-- （全工程 9 处，popup/switch 各 0 处）—— 区域视图就该用 push。
+\t\t--
+\t\t-- **必须大写 B**：modules.lua:192 注册的 name 是 "DebugBoxView"
+\t\t-- （这批 view 里唯一大写开头的）。ViewAreaEntry:response:200 是
+\t\t--   context:getInjector():getInstance(viewName)
+\t\t-- 大小写不匹配返回 nil，接着 DmSceneMediator:286 报
+\t\t--   "attempt to index local 'popupView' (a nil value)"。
+\t\t-- 另外 patch_urlentry 给路由表加了这条，否则会走到
+\t\t-- kExtResponseMap[viewName] 索引 nil 崩。
+\t\tLink = "view://DebugBoxView&viewType=push",
+\t\t-- FixTime + 极宽的时间窗：调试入口不该被活动周期卡住。
+\t\tTimeType = "FixTime",
+\t\tServerOpenTime = 0,
+\t\tServerCloseTime = 4102444800,
+\t\tPlayerOpenCondition = 0,
+\t\tPlayerCloseCondition = 0,
+\t\tDisplayTemplateType = "",
+\t\tSubTemplateType = "",
+\t\tCurrency_icon = {}
+\t}
+
+\tlocal ok, err = pcall(function ()
+\t\t-- DataReader 是**全局表**（DataReader.lua:1-17，`DataReader._cacheDataTable`
+\t\t-- 是普通全局字段），不是 injector 实例，所以直接引用全局名。
+\t\tlocal dr = DataReader
+
+\t\tif type(dr) ~= "table" then
+\t\t\terror("DataReader 全局不可用，type=" .. type(dr))
+\t\tend
+
+\t\t-- 1) 写缓存表：_getRecordById 优先读它（:100-120）
+\t\tdr._cacheDataTable = dr._cacheDataTable or {}
+\t\tdr._cacheDataTable["Activity"] = dr._cacheDataTable["Activity"] or {}
+\t\tdr._cacheDataTable["Activity"][id] = row
+
+\t\t-- 2) _getRecordById:102 走 _isTotalData 判定；这里没有对应的
+\t\t--    false 缓存要清（写的是缓存命中项，不是 false）
+\t\tdr._isTotalData = dr._isTotalData or {}
+\tend)
+
+\tif ok then
+\t\t_yqlrDebugConfigInjected = true
+\t\tprint("[YQLR] 调试活动配置行已注入 DataReader 缓存")
+\telse
+\t\tprint("[YQLR] 注入调试活动配置行失败: " .. tostring(err))
+\tend
+end
+
+'''
+        src = src.replace(ANCHOR, INJECT + ANCHOR)
+        print('    [活动] 已注入 Activity_Debug_Config 配置行注入点')
+    else:
+        print('    [活动] YQLR_DEBUG_ACTIVITY=0，跳过调试活动注入')
+
+    # [YQLR] 探针：把 syncAloneActivity 的实际结果打到 rp.txt。
+    #
+    # 为什么需要：主页「限时活动」弹窗（ActivityMediator）内容来自
+    # BannerSystem:41-59，它要求同时满足
+    #     1. activity:getIsTodayOpen() == 1   <- data.status
+    #     2. activityCfg.Icon ~= "" 且 Icon[1].ListRes 非空
+    # 服务端日志能证明 (1)(2) 都满足，但客户端实际列表还是空的，
+    # 说明链路上还有一环没走通。光看服务端日志无法区分是
+    #   - 配置行没查到（id 不在 Activity 表 -> 整条静默丢弃）
+    #   - status 没读到
+    #   - ActivityModels 没有对应 Type 的模型类
+    # 这里把「创建成功/丢弃」和 status 值都记下来，一次定位。
+    PROBE = '''
+-- [YQLR] 探针：记录 syncAloneActivity 的结果
+local function _yqlr_probe_activity(id, data, activity, cfg)
+\tlocal status = data and data.status
+\tlocal icon = cfg and cfg.Icon
+\tlocal listres = nil
+
+\tif type(icon) == "table" and type(icon[1]) == "table" then
+\t\tlistres = icon[1].ListRes
+\tend
+
+\tlocal line = string.format(
+\t\t'[ACT] id=%s status=%s created=%s listRes=%s\\n',
+\t\ttostring(id), tostring(status),
+\t\ttostring(activity ~= nil), tostring(listres))
+
+\t-- 落盘失败也要能看见：写不进去就 print，别静默丢
+\tlocal f = io.open('/sdcard/rp.txt', 'a')
+
+\tif f then
+\t\tf:write(line)
+\t\tf:close()
+\telse
+\t\tprint('[YQLR] ACT ' .. line)
+\tend
+end
+
+'''
+    ANCHOR2 = 'function ActivityList:ensureDebugActivityConfig()\n'
+    if src.count(ANCHOR2) == 1:
+        src = src.replace(ANCHOR2, PROBE.lstrip('\n') + ANCHOR2)
+
+        # 在 syncAloneActivity 的两个出口各插一次调用
+        OLD4 = ('\t\tif activity then\n'
+                '\t\t\tactivity:synchronize(data)\n')
+        NEW4 = ('\t\tif activity then\n'
+                '\t\t\tactivity:synchronize(data)\n\n'
+                '\t\t\t_yqlr_probe_activity(id, data, activity,\n'
+                '\t\t\t\ttostring(activity:getType() ~= nil) and activity:getConfig() or nil)\n')
+        if src.count(OLD4) == 1:
+            src = src.replace(OLD4, NEW4)
+        OLD5 = ('\t\t\tactivity:setActivitySystem(self._activitySystem)\n'
+                '\t\t\tactivity:synchronize(data)\n')
+        NEW5 = ('\t\t\tactivity:setActivitySystem(self._activitySystem)\n'
+                '\t\t\tactivity:synchronize(data)\n\n'
+                '\t\t\t_yqlr_probe_activity(id, data, activity, config)\n')
+        if src.count(OLD5) == 1:
+            src = src.replace(OLD5, NEW5)
+        print('    [活动] 已注入 syncAloneActivity 探针')
+    else:
+        print('    [活动] 没找到 ensureDebugActivityConfig，跳过探针')
+    # 点击改道不在这里做：活动条目的点击在 ActivityMediator 里（不在补丁
+    # 清单），而它调的是 UnlockSystem:enterViewByUrl，
+    # 所以改道补丁 _patch_debug_activity_click 挂在 UnlockSystem 上。
+    return src
+
+
+# 可在调试面板里改的服务端开关。**必须和 rrcp_server.py 的
+# Server.DEBUG_TOGGLES 完全一致** —— 服务端有白名单，不在表里的名字
+# 会被直接拒（debug_config / debugConfigReset 同理）。
+DEBUG_TOGGLES = [
+    ('HERO_UNLOCK_ALL', 'bool', '角色', '解锁全部角色'),
+    ('HERO_MAX_LEVEL', 'bool', '角色', '角色满级'),
+    ('HERO_MAX_RANK', 'bool', '角色', '突破拉满'),
+    ('HERO_MAX_STAR', 'bool', '角色', '星级拉满'),
+    ('HERO_MAX_FAVOR', 'bool', '角色', '好感拉满'),
+    ('HERO_MAX_BEYOND_UP', 'bool', '角色', '跃升拉满'),
+    ('HERO_UNLOCK_RESOURCES', 'bool', '角色', '解锁 L2D/插画 等形态资源'),
+    ('HERO_LEVEL_CAP', 'int', '角色', '等级上限(0=按配置表推导)'),
+    ('HERO_RANK_CAP', 'int', '角色', '突破上限(0=按配置表推导)'),
+    ('HERO_STAR_CAP', 'int', '角色', '星级上限(0=按配置表推导)'),
+    ('HERO_BEYOND_UP_CAP', 'int', '角色', '跃升档位(0=按配置表推导)'),
+    ('HERO_SET_EXP', 'int', '角色', 'exp 字段值'),
+    ('HERO_RESOURCE_VALUE', 'int', '角色', '形态资源解锁值'),
+    ('RESOURCE_INFINITE', 'bool', '资源', '无限资源总开关'),
+    ('RESOURCE_COUNT', 'int', '资源', '道具统一数量'),
+    ('RESOURCE_PLAYER_CURRENCY', 'bool', '资源', '同时拉满 金币/钻石/经验'),
+    ('RESOURCE_CURRENCY_COUNT', 'int', '资源', '金币/钻石/经验 数量'),
+    ('RESOURCE_SKIP_EXISTING', 'bool', '资源', '保留已有条目不改'),
+    ('LADDER_ORDER', 'int', '天梯', '天梯关卡档位'),
+]
+
+
+def patch_debugmodule(src, _c):
+    """给 DebugBox 面板加一个「服务端配置」分组（只有一条占位指令）。
+
+    游戏自带调试面板（yq/debug/debugBox/）的命令表就是这个文件返回的
+    modules（DebugBoxMediator:122 `require("...DebugModule")`）。
+    原本这里是 19 条 debugConfig 指令，每条 = 开关名输入框 + 值输入框，
+    再点右侧「真」提交 —— 功能对但交互很糙。
+
+    现在只保留**一个**入口：组名「服务端配置」，组内唯一一条
+    `FuncName = "debugConfigPage"`。DebugBoxMediator 补丁（见
+    patch_debugboxmediator）识别到这个 FuncName 就不走通用命令渲染，
+    而是切到用游戏 fgui 组件搭的设置页。19 个开关的表也从这里搬到了
+    DebugBoxMediator 那边（两者共用本文件的 DEBUG_TOGGLES 常量）。
+
+    仍然在 modules 里 append 而不是往表字面量里插：往 `{` 后面插要手工补
+    两处逗号（组前 + 与原第一组之间），很容易漏，漏了就是语法错误。
+    """
+    if os.environ.get('YQLR_DEBUG_CFG_UI', '1') != '1':
+        print('    [调试面板] YQLR_DEBUG_CFG_UI=0，跳过服务端配置入口')
+        return src
+
+    group = (
+        '\n-- [YQLR] 服务端配置面板入口（真正的页面在 DebugBoxMediator 里）。\n'
+        '-- 只留一条占位指令：DebugBoxMediator:refreshParamList 见到\n'
+        '-- FuncName == "debugConfigPage" 就不渲染成通用命令行，\n'
+        '-- 而是切到「角色/资源/天梯」设置页（复用 Site 包的游戏设置行）。\n'
+        '-- 开关表见 build_patched_luac.py 的 DEBUG_TOGGLES，与\n'
+        '-- rrcp_server.py 的 Server.DEBUG_TOGGLES 必须完全一致。\n'
+        'table.insert(modules, {\n'
+        '\tname = "\u670d\u52a1\u7aef\u914d\u7f6e",\n'
+        '\tdata = {\n'
+        '\t\t{\n'
+        '\t\t\tFuncName = "debugConfigPage",\n'
+        '\t\t\tFuncDesc = "19 \u4e2a\u670d\u52a1\u7aef\u5f00\u5173\uff08\u89d2\u8272/\u8d44\u6e90/\u5929\u68af\uff09",\n'
+        '\t\t\tparam = {}\n'
+        '\t\t}\n'
+        '\t}\n'
+        '})\n\n'
+        'return modules\n')
+
+    ANCHOR = 'return modules\n'
+    assert src.count(ANCHOR) == 1, 'DebugModule 的 return modules 未唯一匹配'
+    src = src.replace(ANCHOR, group)
+    print('    [调试面板] 已注入「%s」入口（%d 个开关，改由 DebugBoxMediator 渲染）'
+          % ('\u670d\u52a1\u7aef\u914d\u7f6e', len(DEBUG_TOGGLES)))
+    return src
+
+
+def _cfg_default(name, kind):
+    """服务端开关的初始显示值（服务端 rrcp_server.py DEFAULTS 的对齐值）。
+
+    面板打开时读不到服务端的真实配置（10032 只有 debugConfig /
+    debugConfigReset 两个指令，没有查询口），所以初始值按服务端默认值填，
+    之后每次改动都用服务端返回的 resCode 回写本地缓存。
+    """
+    if kind == 'bool':
+        on = ('HERO_UNLOCK_ALL', 'HERO_MAX_LEVEL', 'HERO_MAX_RANK',
+              'HERO_MAX_STAR', 'HERO_MAX_BEYOND_UP', 'HERO_UNLOCK_RESOURCES',
+              'RESOURCE_INFINITE', 'RESOURCE_PLAYER_CURRENCY')
+        return 'true' if name in on else 'false'
+    return '1'
+
+
+def patch_debugboxmediator(src, _c):
+    """把「服务端配置」从通用命令行重写成游戏设置页观感的专用面板。
+
+    ------------------------------------------------------------------
+    为什么能这么改（可行性判据）
+    ------------------------------------------------------------------
+    硬约束是"不能新建 .fui、不能反编译新 .luac"。两条都能绕开：
+
+    1. **组件复用**，不新建 .fui：
+       - `ui://Site/sg0ft1i` = 游戏设置页 `SiteGamePageWidget` 里的
+         「设置项行」。它的结构不是我猜的，是反编译源码里写死的：
+           SiteGamePageWidget.lua:282  `obj:getController("mode")`
+           SiteGamePageWidget.lua:284  `setSelectedPage(nodeType)`,
+                                       nodeType ∈ {list, slider, voiceList}
+           SiteGamePageWidget.lua:285  `obj:setTitle(...)`
+           SiteGamePageWidget.lua:301  `siteNode:getChild("gameSiteList")`
+                                       是下拉（GList）
+           SiteGamePageWidget.lua:308-319  setItemRenderer / setNumItems /
+                                        ClickItem -> selectCb
+         组件名 sg0ft1i 来自解密后的 Site.fui 的 item 名表（见 MEMORY 第 51 节
+         的解包方法），包名到 URL 的映射是包名而非 packageId：
+         `fgui.UIPackage:createObjectFromURL("ui://Site/sg0ft1i")`。
+       - `ui://DeBugBox/paramCell` = 调试面板自己的参数行，
+         子节点 `text` / `inputText` 见 DebugBoxMediator.lua:330-331
+         （同一个文件，改动前的原始代码）。
+       - 左列分组复用 BoxView 自带的 `bagItemsList`（initView:54），
+         右列列表复用 `paramLayout` / `paramList`（initView:55-56）。
+       - Site 包按 DmGame.lua:38-42 的标准写法
+         `fgui.UIPackage:addPackage("asset/ui/Site")` 加载。
+
+    2. **补丁目标已存在**：DebugBoxMediator.luac 的反编译源码本来就在
+       `_out_decompile/lua/yq/debug/debugBox/view/`，且实测能被本地
+       LuaJIT 编译通过（不需要 fix_syntax 修补），tagpath 由原始 .luac 的
+       md5 推导并与运行时 assets.db 里的 real 字段核对一致：
+         md5    194ae4c12dff063e90fa5e65476807b4
+         real   release/19/4a/e4c12dff063e90fa5e65476807b4.luac
+
+    ------------------------------------------------------------------
+    bool / int 两类控件
+    ------------------------------------------------------------------
+    - bool -> Site 设置行 + `gameSiteList` 下拉（开 / 关），点选即生效。
+      这正是游戏设置页改战斗动画 / 帧率的方式（SiteGamePageWidget:311-319），
+      点了就 apply，不额外加"确认"按钮。
+    - int  -> paramCell 的 `inputText`，提交时机用
+      `getEditBox():registerScriptEditBoxHandler` 的 "ended"/"return"，
+      抄 SiteGamePageWidget.lua:38-52 对 gameDidLab 的写法 —— Android 上
+      软键盘收起必然发 "ended"，比单等 UIEventType.Enter 稳。
+    - 恢复默认 -> 每个分组末尾追加一条「恢复全部服务端默认配置」伪行，
+      点一下发 `debugConfigReset`（服务端原指令，没动服务端逻辑）。
+
+    ------------------------------------------------------------------
+    值从哪来
+    ------------------------------------------------------------------
+    opcode 10032 只有 debugConfig / debugConfigReset，没有查询口
+    （rrcp_server.py:2215-2260），所以当前值存在
+    `GameConfigs.DebugCfgValues` 这个客户端缓存里：
+      - 打开页面时按服务端默认值填（_cfg_default）
+      - 每次发送 resCode == 0 就回写（顺便提示"这是缓存值"）
+    不改成"读回来再显示"是因为那要动服务端，任务明确不许动。
+    """
+    if os.environ.get('YQLR_DEBUG_CFG_UI', '1') != '1':
+        print('    [配置面板] YQLR_DEBUG_CFG_UI=0，跳过')
+        return src
+
+    # ---- 1. initView 里把模块列表渲染器存一份，退出配置页时还原 ----
+    OLD = '\tself._list:setItemRenderer(fun1)\n'
+    NEW = ('\tself._list:setItemRenderer(fun1)\n'
+           '\t-- [YQLR] 存一份模块列表渲染器：进入服务端配置页时左列会被\n'
+           '\t-- 换成分组页，返回时要用它还原（见 leaveServerConfig）。\n'
+           '\tself._moduleListRenderer = fun1\n')
+    assert src.count(OLD) == 1, 'initView 的 setItemRenderer(fun1) 未唯一匹配'
+    src = src.replace(OLD, NEW)
+
+    # ---- 2. 模块列表点击改道 + 修 index 闭包过期 ----
+    OLD = ('\t\tobj:addEventListener(fgui.UIEventType.Click, function ()\n'
+           '\t\t\tself:refreshParamList(self._modules[index + 1].data)\n'
+           '\t\tend, 99999)\n')
+    NEW = ('\t\t-- [YQLR] 原实现有两个问题：\n'
+           '\t\t--  1) 闭包捕获的 index 会过期。列表是虚拟化 + 循环复用\n'
+           '\t\t--     (initView 下面 setVirtualAndLoop)，同一个 obj 会反复被\n'
+           '\t\t--     渲染成不同分组，而每次渲染都再 addEventListener 一次，\n'
+           '\t\t--     老闭包不会被移除 —— 点 A 会同时打开 A 和 A 曾经\n'
+           '\t\t--     复用过的那些分组。\n'
+           '\t\t--  2) 改成 getChildIndex(obj) 也不行：实测在这个\n'
+           '\t\t--     setVirtualAndLoop 的列表上，getChildIndex 返回的是\n'
+           '\t\t--     子节点在 _children 里的位置，与逻辑下标差 8，\n'
+           '\t\t--     点「服务端配置」实际打开了「悬赏任务」。\n'
+           '\t\t-- 正确做法是抄 SiteGamePageWidget.lua:535 / :561 的写法：\n'
+           '\t\t-- 渲染时把下标挂到 obj 上（obj.id = ...），点击时再读回来。\n'
+           '\t\t-- 这样不管行被复用多少次、监听器堆了几个，读到的永远是\n'
+           '\t\t-- 最近一次渲染写进去的值。\n'
+           '\t\tobj.yqlrModIndex = index\n'
+           '\t\tobj:addEventListener(fgui.UIEventType.Click, function ()\n'
+           '\t\t\tself:onDebugModuleClick(obj.yqlrModIndex)\n'
+           '\t\tend, 99999)\n')
+    assert src.count(OLD) == 1, 'initView 模块列表的 Click 监听未唯一匹配'
+    src = src.replace(OLD, NEW)
+
+    # ---- 3. refreshParamList 开头退出配置页 ----
+    # 直接改写函数体而不是靠调用点，兜住所有其它入口。
+    OLD = ('function DebugBoxMediator:refreshParamList(data)\n'
+           '\tlocal saved = SavedAs\n')
+    NEW = ('function DebugBoxMediator:refreshParamList(data)\n'
+           '\t-- [YQLR] 渲染通用命令行之前先把右列的 itemProvider 还原成默认\n'
+           '\t-- （配置页给 _paramList 装过异构 itemProvider）。\n'
+           '\tself:leaveServerConfig()\n\n'
+           '\tlocal saved = SavedAs\n')
+    assert src.count(OLD) == 1, 'refreshParamList 开头未唯一匹配'
+    src = src.replace(OLD, NEW)
+
+    # ---- 4. enterWithData 里初始化配置页 ----
+    OLD = ('function DebugBoxMediator:enterWithData()\n'
+           '\tself:initData()\n'
+           '\tself:initView()\n'
+           'end\n')
+    NEW = ('function DebugBoxMediator:enterWithData()\n'
+           '\tself:initData()\n'
+           '\tself:initView()\n'
+           '\t-- [YQLR] 服务端配置页的常量 / 缓存，依赖 initView 拿到的节点\n'
+           '\tself:initServerConfig()\n'
+           'end\n')
+    assert src.count(OLD) == 1, 'enterWithData 未唯一匹配'
+    src = src.replace(OLD, NEW)
+
+    # ---- 5. 追加整块实现 ----
+    rows = []
+    for name, kind, grp, desc in DEBUG_TOGGLES:
+        rows.append(
+            '\t{\n'
+            '\t\tn = "%s",\n'
+            '\t\tk = "%s",\n'
+            '\t\tg = "%s",\n'
+            '\t\td = "%s",\n'
+            '\t\tv = "%s"\n'
+            '\t}' % (name, kind, grp, desc, _cfg_default(name, kind)))
+
+    # 源码里出现的中文必须是 UTF-8，且 .py 本身是 UTF-8（文件头有 coding 声明），
+    # 这里用 \uXXXX 直接写出，避免任何终端编码参与。
+    # 分组顺序取 DEBUG_TOGGLES 里**首次出现**的顺序（角色 -> 资源 -> 天梯），
+    # 不要用 sorted()：那会按码点排成 天梯/资源/角色，和声明顺序对不上。
+    groups = []
+    for _, _, g, _ in DEBUG_TOGGLES:
+        if g not in groups:
+            groups.append(g)
+
+    block = '\n' + r'''
+-- =====================================================================
+-- [YQLR] 服务端配置面板
+--
+-- 复用游戏自己的 fgui 组件（不新建 .fui）：
+--   ui://Site/sg0ft1i       游戏设置页的「设置项行」
+--                           结构依据：SiteGamePageWidget.lua:282-322
+--   ui://DeBugBox/paramCell 调试面板自己的「参数行」
+--                           结构依据：本文件原来的 refreshParam:330-331
+-- 左列分组沿用 BoxView 自带的 bagItemsList，右列沿用 paramLayout/paramList。
+--
+-- 发送链路不变：DebugBoxService:requestTest -> opcode 10032
+--（DebugBoxMediator.lua:117 是本文件原实现里的同一处调用）。
+-- 服务端白名单 19 个名字，见 rrcp_server.py 的 Server.DEBUG_TOGGLES。
+-- =====================================================================
+
+-- 分组页的左列：前 kCfgTabCount 个是分组，最后一个是返回。
+-- 必须在这里把返回项一起烘进表字面量：运行时用 `tabs[#tabs+1] = ...`
+-- 追加会因为 enterServerConfig 被多次调用而不断变长。
+local kCfgTabCount = __TABCOUNT__;
+local kCfgTabs = {
+__TABS__
+};
+local kCfgTabBack = "__BACK__";
+-- bool 行的下拉项（显示文本 -> 发给服务端的值）。
+local kCfgBoolItems = {"开", "关"};
+local kCfgBoolValues = {"true", "false"};
+local kCfgResetName = "@reset";
+local kCfgResetDesc = "恢复全部服务端默认配置（会重登生效）";
+local kCfgSiteRowUrl = "ui://Site/sg0ft1i";
+local kCfgParamCellUrl = "ui://DeBugBox/paramCell";
+
+-- 19 个开关：n=开关名 k=bool/int g=分组 d=说明 v=初始值。
+local kServerCfg = {
+__ROWS__
+};
+
+-- 探针：名字取 _rp_probe 是为了能被 release profile 的
+-- PROBE_FNS 门控自动关闭（build_patched_luac.py 末尾那段正则替换）。
+local function _rp_probe(msg)
+	local f = io.open("/sdcard/rp.txt", "a")
+
+	if f then
+		f:write("[CFG] " .. tostring(msg) .. "\n")
+
+		f:close()
+	end
+end
+
+function DebugBoxMediator:initServerConfig()
+	GameConfigs.DebugCfgValues = GameConfigs.DebugCfgValues or {}
+
+	for i = 1, #kServerCfg do
+		local cell = kServerCfg[i]
+
+		GameConfigs.DebugCfgValues[cell.n] = GameConfigs.DebugCfgValues[cell.n] or cell.v
+	end
+
+	self._cfgOn = false
+	self._cfgGroup = 1
+	self._cfgRows = {}
+	self._cfgSiteLoaded = false
+end
+
+function DebugBoxMediator:onDebugModuleClick(index)
+	local mod = self._modules[index + 1]
+
+	if not mod then
+		_rp_probe("onDebugModuleClick 越界 index=" .. tostring(index))
+
+		return
+	end
+
+	local data = mod.data or {}
+	local first = data[1]
+
+	_rp_probe("onDebugModuleClick idx=" .. tostring(index) .. " name=" ..
+		tostring(mod.name) .. " func=" .. tostring(first and first.FuncName))
+
+	if first and first.FuncName == "debugConfigPage" then
+		self:enterServerConfig()
+
+		return
+	end
+
+	self:refreshParamList(data)
+end
+
+function DebugBoxMediator:ensureSitePackage()
+	-- 和 DmGame.lua:38-42 / TestListMediator.lua:35-36 同一个写法：
+	-- 先 addPackage 再 createObjectFromURL。addPackage 在本工程是
+	-- UIPackageExt.lua:27 包过的引用计数版，重复调用安全。
+	if self._cfgSiteLoaded then
+		return
+	end
+
+	local ok = pcall(function ()
+		fgui.UIPackage:addPackage("asset/ui/Site")
+
+		self._cfgSiteLoaded = true
+	end)
+
+	if not ok then
+		_rp_probe("addPackage(Site) 失败")
+	end
+end
+
+function DebugBoxMediator:enterServerConfig()
+	self:ensureSitePackage()
+
+	self._cfgOn = true
+	self._cfgGroup = 1
+	self._paramLayout:setVisible(true)
+
+	local tabs = kCfgTabs
+
+	-- 左列换成「全部 / 角色 / 资源 / 天梯 / 返回」
+	self._list:setItemRenderer(function (index, obj)
+		local text = obj:getChild("text")
+
+		text:setText(tabs[index + 1])
+		-- 同上：下标挂在 obj 上，不靠闭包捕获，也不靠 getChildIndex
+		obj.yqlrTabIndex = index + 1
+		obj:addEventListener(fgui.UIEventType.Click, function ()
+			local cur = obj.yqlrTabIndex
+
+			AudioEngine:getInstance():playEffect("Se_Click_Tab", false)
+
+			if cur == #tabs then
+				self:leaveServerConfig()
+
+				self._paramLayout:setVisible(false)
+			else
+				self._cfgGroup = cur
+				self:showServerCfgGroup(cur)
+			end
+		end, 99999)
+	end)
+	self._list:setNumItems(#tabs)
+	self._list:setSelectedIndex(1)
+	self:showServerCfgGroup(1)
+end
+
+function DebugBoxMediator:leaveServerConfig()
+	if not self._cfgOn then
+		return
+	end
+
+	self._cfgOn = false
+	self._paramList:setItemProvider(nil)
+
+	if self._moduleListRenderer then
+		self._list:setItemRenderer(self._moduleListRenderer)
+		self._list:setNumItems(#self._modules)
+		self._list:setSelectedIndex(1)
+	end
+end
+
+function DebugBoxMediator:showServerCfgGroup(groupIndex)
+	local want = kCfgTabs[groupIndex]
+	local rows = {}
+
+	for i = 1, #kServerCfg do
+		if want == "全部" or kServerCfg[i].g == want then
+			rows[#rows + 1] = kServerCfg[i]
+		end
+	end
+
+	rows[#rows + 1] = {
+		n = kCfgResetName,
+		k = "reset",
+		g = want,
+		d = kCfgResetDesc
+	}
+
+	self._cfgRows = rows
+	self._paramList:setItemProvider(function (index)
+		local cell = self._cfgRows[index + 1]
+
+		if cell and cell.k == "int" then
+			return kCfgParamCellUrl
+		end
+
+		return kCfgSiteRowUrl
+	end)
+	self._paramList:setItemRenderer(function (index, obj)
+		local cell = self._cfgRows[index + 1]
+
+		if not cell then
+			return
+		end
+
+		if cell.k == "int" then
+			self:renderCfgIntRow(obj, cell)
+		else
+			self:renderCfgSwitchRow(obj, cell)
+		end
+	end)
+	-- 异构行高（Site 设置行 vs paramCell），不能用 setVirtualAndLoop，
+	-- 那要求所有 item 等高；和 SitePlayerPageWidget 的用法一致。
+	self._paramList:setVirtual()
+	self._paramList:setNumItems(#rows)
+	_rp_probe("显示分组 " .. tostring(want) .. " 共 " .. #rows .. " 行")
+end
+
+function DebugBoxMediator:renderCfgSwitchRow(obj, cell)
+	local ok = pcall(function ()
+		local isReset = cell.k == "reset"
+
+		if isReset then
+			obj:setTitle(cell.d)
+		else
+			obj:setTitle(cell.d .. "  [" .. cell.n .. "]")
+		end
+
+		obj:getController("mode"):setSelectedPage("list")
+
+		local list = obj:getChild("gameSiteList")
+
+		if isReset then
+			list:setItemRenderer(function (index, item)
+				item:setTitle("确认恢复默认")
+			end)
+			list:setNumItems(1)
+			list:setSelectedIndex(0)
+		else
+			list:setItemRenderer(function (index, item)
+				item:setTitle(kCfgBoolItems[index + 1])
+			end)
+			list:setNumItems(2)
+			list:setSelectedIndex(
+				GameConfigs.DebugCfgValues[cell.n] == "true" and 0 or 1)
+		end
+
+		list:ensureBoundsCorrect()
+		list:addEventListener(fgui.UIEventType.ClickItem, function (context)
+			local item = context:getData()
+
+			item = tolua.cast(item, "fgui.GObject")
+			local pick = list:getChildIndex(item)
+
+			AudioEngine:getInstance():playEffect("Se_Click_Common_03", false)
+
+			if isReset then
+				self:resetServerCfg()
+			else
+				self:sendServerCfg(cell.n, kCfgBoolValues[pick + 1])
+			end
+		end, 99999)
+	end)
+
+	if not ok then
+		_rp_probe("Site 设置行渲染失败: " .. tostring(cell.n))
+	end
+end
+
+function DebugBoxMediator:renderCfgIntRow(obj, cell)
+	local text = obj:getChild("text")
+	local input = obj:getChild("inputText")
+
+	text:setText(cell.d .. "  [" .. cell.n .. "]")
+	input:setText(GameConfigs.DebugCfgValues[cell.n])
+
+	-- 提交时机抄 SiteGamePageWidget.lua:38-52（gameDidLab 的写法）：
+	-- Android 软键盘收起必然发 "ended"，比只等 UIEventType.Enter 稳。
+	local ok = pcall(function ()
+		local editBox = input:getEditBox()
+
+		editBox:unregisterScriptEditBoxHandler()
+		editBox:registerScriptEditBoxHandler(function (eventName)
+			if eventName == "ended" or eventName == "return" then
+				self:sendServerCfg(cell.n, string.trim(input:getText()))
+			end
+		end)
+	end)
+
+	if not ok then
+		_rp_probe("int 行没有 EditBox，回退到 Enter 事件: " .. tostring(cell.n))
+	end
+
+	input:addEventListener(fgui.UIEventType.Enter, function ()
+		self:sendServerCfg(cell.n, string.trim(input:getText()))
+	end, 99999)
+end
+
+function DebugBoxMediator:sendServerCfg(name, value)
+	local params = {
+		"debugConfig",
+		name,
+		tostring(value)
+	}
+
+	self._debugBoxService:requestTest(params, function (response)
+		local tipStr = "操作成功"
+
+		if response.data and type(response.data) == "string" then
+			tipStr = response.data
+		end
+
+		if response.resCode == 0 then
+			GameConfigs.DebugCfgValues[name] = tostring(value)
+		end
+
+		self:dispatch(ShowTipEvent({
+			tip = tipStr
+		}))
+		_rp_probe(name .. " <- " .. tostring(value) .. " resCode=" ..
+			tostring(response.resCode))
+	end)
+end
+
+function DebugBoxMediator:resetServerCfg()
+	self._debugBoxService:requestTest({ "debugConfigReset" }, function (response)
+		local tipStr = "操作成功"
+
+		if response.data and type(response.data) == "string" then
+			tipStr = response.data
+		end
+
+		if response.resCode == 0 then
+			for i = 1, #kServerCfg do
+				local cell = kServerCfg[i]
+
+				GameConfigs.DebugCfgValues[cell.n] = cell.v
+			end
+
+			self:showServerCfgGroup(self._cfgGroup)
+		end
+
+		self:dispatch(ShowTipEvent({
+			tip = tipStr
+		}))
+		_rp_probe("resetServerCfg resCode=" .. tostring(response.resCode))
+	end)
+end
+'''
+    block = (block
+             .replace('__TABCOUNT__', str(len(groups)))
+             .replace('__TABS__',
+                      ',\n'.join('\t"%s"' % g for g in ['全部'] + groups +
+                                ['<< \u8fd4\u56de\u8c03\u8bd5\u529f\u80fd']))
+             .replace('__BACK__', '<< \u8fd4\u56de\u8c03\u8bd5\u529f\u80fd')
+             .replace('__ROWS__', ',\n'.join(rows)))
+
+    src = src.rstrip('\n') + '\n' + block
+    print('    [配置面板] DebugBoxMediator 已注入设置页：%d 个开关 / %d 个分组'
+          % (len(DEBUG_TOGGLES), len(groups)))
     return src
 
 
@@ -1431,7 +2273,10 @@ def patch_dmaudio(src, _c):
       3) audioDirector:loadAcbFile    返回的 acbHn 是否为 nil
       4) playCueByNameFromBlock       返回的 audioPlayback 是否为 nil
       5) configData.CueName / PkgName 传给 native 的参数
+
+    另外还负责把中文语音指向公共目录 /storage/emulated/0/yqlr/（见下方注释）。
     """
+    # ------------------------------------------------------------------
     helper = """
 -- [PATCH] 配音探针：print 进不了 logcat，改写文件
 local function _ap_probe(msg)
@@ -1619,6 +2464,71 @@ _ap_probe("---- srv introspect end ----")
     src = src.replace(old, new, 1)
 
     print('    [探针] dmAudio 配音链路 6 个判定点已写入 rp.txt')
+
+    # ------------------------------------------------------------------
+    # 公共目录补丁放在**最后**做。
+    # 原因：本函数上面的探针变换是靠字符串锚点
+    # （'local awbExist = ...\n\n\t\tif awbExist then'）定位的，
+    # 而下面这段会把那个 'if awbExist then' 改成 'elseif' 并插入新分支。
+    # 谁先跑，谁就破坏另一个的锚点 —— 之前就是这里 AssertionError 的。
+    # ------------------------------------------------------------------
+    # [PATCH] 公共目录回退：中文语音从 /storage/emulated/0/yqlr/ 读
+    #
+    # 为什么需要（原包根本没有 cn 语音）：
+    #   MEMORY 33.1 实测 db.real × ZIP namelist 逐条比对 ——
+    #     sound/voice_cn 在 APK 0 / 缺 240，sound/voice_jp 在 APK 234 / 缺 0
+    #   cn/en 是"可选下载语言包"，音频文件没打进 APK。
+    #   素材已由 inject_voice_cn.py 校验通过（240/240 名字+size+MD5 全对），
+    #   但打进 APK 会让 APK 超过 2^31，zipalign / apksigner 双双失败
+    #   （中央目录偏移越过 2^31，32 位有符号解释变负）。
+    #   所以改走公共目录：文件由用户/部署脚本放好，游戏自己去读。
+    #
+    # 为什么两条路都加（不确定它走哪条）：
+    #   1) addSearchPath —— 保持相对路径不变，让 FileUtils 自己在搜索路径里找，
+    #      这是最安全的，loadAcbFile 仍然收到相对路径
+    #   2) 绝对路径兜底 —— 万一游戏的资源解析器绕过了 FileUtils 的搜索路径，
+    #      就直接把绝对路径喂给 loadAcbFile
+    pub_head = (
+        '\n-- [PATCH] 公共语音目录（/storage/emulated/0/yqlr/sound/voice_cn/）\n'
+        'local YQLR_PUB = "/storage/emulated/0/yqlr/"\n'
+        'do\n'
+        '\tlocal okc, cu = pcall(function ()\n'
+        '\t\treturn cc and cc.FileUtils and cc.FileUtils:getInstance()\n'
+        '\tend)\n'
+        '\tif okc and cu then\n'
+        '\t\tpcall(function () cu:addSearchPath(YQLR_PUB, true) end)\n'
+        '\tend\n'
+        'end\n')
+    # patcher 拿到的 src 已经过 fix_syntax()，与磁盘上的反编译文件不完全一致
+    # （实测行数 804 -> 805），所以锚点一律用正则、尽量短。
+    m = re.search(r'local soundAwbExtension\s*=\s*"\.awb"', src)
+    assert m, 'dmAudio: soundAwbExtension 锚点没找到'
+    src = src[:m.end()] + pub_head + src[m.end():]
+
+    # 加载分支：公共目录优先，其次才是原来的 awbExist / filePath。
+    m = re.search(r'\n([ \t]*)if awbExist then\b', src)
+    assert m, 'dmAudio: if awbExist 锚点没找到'
+    ind = m.group(1)
+    pub_branch = (
+        '\n'
+        + ind + '-- [PATCH] 先看公共目录，用户可自行放置/替换语音包\n'
+        + ind + 'local _pubAcb = YQLR_PUB .. filePath\n'
+        + ind + 'local _pubAwb = YQLR_PUB .. awbFilePath\n'
+        + ind + 'local _pubAwbExist = fileUtils:isFileExist(_pubAwb)\n'
+        + ind + 'if _pubAwbExist or fileUtils:isFileExist(_pubAcb) then\n'
+        + ind + '\tfileExist = true\n'
+        + ind + '\tif _pubAwbExist then\n'
+        + ind + '\t\tacbHn = audioDirector:loadAcbFile(_pubAcb, _pubAwb)\n'
+        + ind + '\telse\n'
+        + ind + '\t\tacbHn = audioDirector:loadAcbFile(_pubAcb)\n'
+        + ind + '\tend\n'
+        + ind + '\t-- 探针在 release 里会被摘掉，必须判空再用\n'
+        + ind + '\tif _ap_probe then\n'
+        + ind + '\t\t_ap_probe("公共目录命中 " .. packageName .. tostring(ttype))\n'
+        + ind + '\tend\n'
+        + ind + 'elseif awbExist then')
+    src = src[:m.start()] + pub_branch + src[m.end():]
+    print('    [公共目录] 中文语音 -> /storage/emulated/0/yqlr/sound/voice_cn/')
     return src
 
 
@@ -1690,8 +2600,370 @@ end
     return src
 
 
+def patch_homecenterwidget(src, _c):
+    """禁用主页中间的"活动"空白弹窗。
+
+    现象：点主页中间 -> 弹出一个只有日期、下面什么都没有的弹窗。
+
+    链路（都在 HomeCenterWidget.lua 里，且是**客户端硬编码**的，删不掉）：
+        KRightListData[1] = { btnType = "Banner", funcCallback = "bannerCallback" }
+        HomeCenterWidget:bannerCallback()  -> injector:getInstance("activityView")
+                                            -> EVT_SHOW_POPUP
+        HomeCenterWidget:showActivityList() -> 同上
+    activityView 就是 ActivityMediator，它只渲染 activityList；
+    离线服没有活动数据，列表为空 -> 整块白板。
+
+    KRightListData 是写死的 Lua 表，服务端下发 ActivityData 也删不掉这个入口。
+
+    **现在默认不删这个补丁了**（YQLR_NO_ACT_POPUP 默认改成 0）：
+    白板的真正原因在服务端，不是客户端入口有问题。弹窗内容由
+        ActivityMediator:145-156 -> BannerSystem:41-59
+    决定，要两个条件同时成立：
+        1. activity:getIsTodayOpen() == 1  <- BaseActivity:53 读 data.status
+        2. activityCfg.Icon ~= ""        <- Activity.tsv 的 Icon 列
+    原来表里那 3 个活动（Activity_MainLineFund / Activity_TowerFund /
+    Activity_Deposit）**都没带 status**，getIsTodayOpen() 恒为 STATUS_INIT(0)，
+    于是一个都进不了 banner 列表 -> 白板。
+    服务端已在 apply_banner_activity() 里下发几个真实的 Limit 类活动
+    （status=1 + Icon[1].ListRes 非空），白板问题从根上解决，
+    所以入口不再需要禁用。
+
+    仍保留这个开关：万一要临时屏蔽入口，设 YQLR_NO_ACT_POPUP=1 即可。
+    """
+    if os.environ.get('YQLR_NO_ACT_POPUP', '0') != '1':
+        print('    [主页] 活动弹窗入口已保留（服务端已下发 banner 数据）')
+        return src
+
+    patched = 0
+    for fn in ('bannerCallback', 'showActivityList'):
+        # 只替换函数体第一行之后的内容，保留 AudioEngine 那行静音副作用
+        m = re.search(
+            r'(function HomeCenterWidget:%s\([^)]*\)\n)([^\n]*\n)(.*?)(\nend\n)' % fn,
+            src, re.S)
+        if not m:
+            print('    [主页] %s 没匹配到，跳过' % fn)
+            continue
+        body = m.group(3)
+        new = (m.group(1) + m.group(2)
+               + '\t-- [YQLR] 活动弹窗已禁用（离线服无活动数据，弹窗是空白的）\n'
+               + '\tif true then return end\n'
+               + '\t--[[ 原实现\n' + body + ']]' + m.group(4))
+        src = src[:m.start()] + new + src[m.end():]
+        patched += 1
+
+    print('    [主页] 已禁用 %d 个活动弹窗入口（bannerCallback / showActivityList）' % patched)
+    return src
+
+
+def patch_urlentry(src, _c):
+    """给 UrlEntry 的路由表加一条 view://debugBoxView。
+
+    现象：点「限时活动」弹窗里的调试活动 -> LUA_ERROR
+        "UrlEntry.lua:343: attempt to index a nil value"
+    调用链：
+        ActivityMediator:103-110  _unlockSystem:enterViewByUrl(cfg.Link, ...)
+        -> UnlockSystem:294 enterViewByUrl
+        -> UnlockSystem:284 openViewEventByUrl -> EVT_OPENURL
+        -> biubiu/legs/core/command/OpenUrlCommand:4-25 execute
+        -> UrlEntryManage.resolveUrlWithUserData
+
+    resolveUrlWithUserData 的查找有两级（:304-313）：
+        1. mapping = getURLMappingEntries()   -- 可写的普通 Lua 表
+        2. mapping[page] 为空才 fallback 到 kExtResponseMap[viewName].entry
+    debugBoxView 两边都没有，而 :310 的 `kExtResponseMap[viewName].entry`
+    在 viewName 缺失时就是**索引 nil**，直接崩（连 :313 的 assert
+    " URL %s not found" 和 OpenUrlCommand:9-16 的「功能未开放」提示
+    都到不了 —— 那两处本来正好是干净的兜底，被崩在前面了）。
+
+    正解是往第 1 级表里加一条：它是普通 Lua 表，加完 debugBoxView 就能
+    正常走 ViewAreaEntry:response，不再碰 kExtResponseMap。
+    DebugBoxView 在 modules.lua:192-193 已注册
+    （name = "DebugBoxView", mediator = "DebugBoxMediator"），
+    只差这条路由。
+    """
+    OLD = '\t\t["view://signTenView"] = ViewAreaEntry:new("signTenView")\n'
+    NEW = ('\t\t["view://signTenView"] = ViewAreaEntry:new("signTenView"),\n'
+           '\t\t-- [YQLR] 调试面板入口（Activity_Debug_Config 的 Link）。\n'
+           '\t\t-- 键名必须是 **DebugBoxView**（大写 B）：modules.lua:192\n'
+           '\t\t-- 注册的 name 就是这个，ViewAreaEntry:response:200 用它\n'
+           '\t\t-- 去 injector 取实例，大小写不匹配会拿到 nil，\n'
+           '\t\t-- 然后 DmSceneMediator:286 报\n'
+           '\t\t--   "attempt to index local \'popupView\' (a nil value)"。\n'
+           '\t\t-- 没有这条路由则会走到 kExtResponseMap[viewName] 索引 nil。\n'
+           '\t\t["view://DebugBoxView"] = ViewAreaEntry:new("DebugBoxView")\n')
+    n = src.count(OLD)
+    assert n == 1, 'URLMappingEntries 的插入点未唯一匹配（命中 %d 次）' % n
+    src = src.replace(OLD, NEW)
+    # 防呆：ViewAreaEntry 的 viewName 必须和 modules.lua:192 注册的
+    # name 完全一致（大小写敏感），否则 injector 取不到实例，
+    # 表现为 DmSceneMediator:286 "attempt to index local 'popupView'"。
+    # 这条断言放在这里，比等设备上点了发现没反应便宜得多。
+    assert 'ViewAreaEntry:new("DebugBoxView")' in src, \
+        'DebugBoxView 的 viewName 必须大写 B'
+    print('    [路由] UrlEntry 已加 view://DebugBoxView')
+    return src
+
+
+def patch_sitegamepagewidget(src, _c):
+    """把 19 个服务端开关挂进**游戏设置页**的渲染链（UI 重构的核心）。
+
+    ------------------------------------------------------------------
+    为什么不继续用 DebugBox 面板
+    ------------------------------------------------------------------
+    DebugBox（ui://DeBugBox/BoxView）是游戏自带的**无美术开发面板**：
+    它自己的标题就是 "What's your dream?"（实测是 DeBugBox.fui 里的原文，
+    7275 B，不引用任何图集），渲染出来是蓝底 + 白色默认色块。
+    功能能跑，但和游戏的正式界面完全不像 —— 不满足"和游戏一致性"。
+
+    ------------------------------------------------------------------
+    为什么能挂进设置页
+    ------------------------------------------------------------------
+    `SiteGamePageWidget:getSiteGameData()`（:61-251）是一个**纯数据函数**，
+    返回一组"设置项"描述；`initSiteList`（:253-357）是它的通用渲染器，
+    已经完整处理了三种行形态（全部有源码依据）：
+        type = "list"      -> 下拉（GList，:292-322）
+            setItemRenderer / setNumItems / ClickItem -> selectCb(index)
+            initFunc 返回当前选中下标
+        type = "slider"    -> 滑条（:324-344）
+        type = "voiceList" -> 自定义 widget（:346-351）
+    每行还有 `obj:getController("mode"):setSelectedPage(nodeType)`（:282-284）
+    和 `obj:setTitle(Strings:get(config.title))`（:285）。
+
+    所以只要在 `return GameSiteConfig`（:250）之前 table.insert 我们的行，
+    就**完全复用游戏自己的渲染代码** —— 外观、排版、音效、红点全部一致，
+    我们一行 UI 代码都不用写。这比在 DebugBox 里手搓控件更"游戏一致"。
+
+    ------------------------------------------------------------------
+    行数据形状（对齐 :64-88 的 gameSiteAni）
+    ------------------------------------------------------------------
+        { name = <唯一键>, type = "list", index = <排序>, title = <显示名>,
+          enable = true, values = {"关","开"},     -- 下拉项（Strings key）
+          selectCb = function (index) ... end,      -- 玩家改动时回调
+          initFunc  = function (userSite) ... end }  -- 当前值（返回下标）
+    `initSiteList:285` 走 Strings:get(title)，所以 title 得是 Text 表里的
+    key。我们没有新增文案，改用「开关名」本身当 title 会显示成空
+    （Strings:get 对不存在的 key 返回 nil）—— 见下方 title 的构造。
+
+    ------------------------------------------------------------------
+    值的读写
+    ------------------------------------------------------------------
+    服务端只有写（opcode 10032 `debugConfig <名> <值>`），**没有读接口**。
+    所以当前值只能本地缓存（GameConfigs.DebugCfgValues），初始取默认值。
+    这和游戏自己的做法同构（设置项本来就先乐观渲染、后落盘）。
+    重启 mock 后服务端会回到默认，这里缓存的旧值就成了陈旧显示；
+    需要一个「重新同步」入口 —— 见最后的 debugConfigReset 行。
+    """
+
+    ANCHOR = '\treturn GameSiteConfig\nend\n'
+
+    # ---- 1. 生成 Lua 侧的开关表（名字 -> 默认值 / 分组 / 类型）----
+    rows = []
+    idx = 100          # 原表 index 最大约 30，100 起保证排到最后
+    for name, kind, grp, desc in DEBUG_TOGGLES:
+        if kind == 'bool':
+            values = '{"\u5173", "\u5f00"}'
+            # 必须走 _YQLR_CFG_VALUES()，不能直接摸 GameConfigs.DebugCfgValues。
+            # 后者是**惰性**初始化的（PRELUDE 里 `or {默认值}` 那一行只在
+            # _YQLR_CFG_VALUES() 被调用时才建表），而 initFunc 是页面一渲染
+            # 就跑的 —— 玩家刚进设置页、还没点过任何开关，字段还是 nil，
+            # 直接索引就炸：
+            #   SiteGamePageWidget.luac:400: attempt to index field
+            #   'DebugCfgValues' (a nil value)
+            init = ('function ()\n\t\t\t\t\t\t\treturn '
+                    '(_YQLR_CFG_VALUES()["%s"] and 1 or 0)\n\t\t\t\t\t\tend' % name)
+
+        else:
+            values = '{"0", "1", "2", "3", "5", "10", "50", "100"}'
+            init = ('function ()\n\t\t\t\t\t\t\t\treturn '
+                    '(_YQLR_CFG_INDEX["%s"] or 0)\n\t\t\t\t\t\tend' % name)
+        rows.append(
+            '\t\ttable.insert(data, {\n'
+            '\t\t\tname = "yqlr_cfg_%s",\n'
+            '\t\t\ttype = "list",\n'
+            '\t\t\tindex = %d,\n'
+            '\t\t\ttitle = "%s \u00b7 %s",\n'
+            '\t\t\tenable = true,\n'
+            '\t\t\tvalues = %s,\n'
+            '\t\t\tselectCb = function (index)\n'
+            '\t\t\t\t_YQLR_CFG_SET(self._dbgSvc, "%s", index)\n'
+            '\t\t\tend,\n'
+            '\t\t\tinitFunc = %s\n'
+            '\t\t})' % (name, idx, grp, desc, values, name, init))
+        idx += 1
+    rows_src = '\n'.join(rows)
+
+    PRELUDE = '''
+-- [YQLR] 服务端配置项：读写 opcode 10032
+-- 服务端只提供写（debugConfig），没有读接口，所以当前值本地缓存于
+-- GameConfigs.DebugCfgValues（和游戏自己的设置项同构：先乐观渲染、后落盘）。
+local function _YQLR_CFG_VALUES()
+\tGameConfigs.DebugCfgValues = GameConfigs.DebugCfgValues or {
+%s
+\t}
+
+\treturn GameConfigs.DebugCfgValues
+end
+
+-- int 档位下拉的下标 -> 实际值（values 的顺序就是这张表）
+local _YQLR_CFG_INDEX = {
+%s
+}
+
+local _YQLR_CFG_INT_VALUES = { "0", "1", "2", "3", "5", "10", "50", "100" }
+
+-- 写：把值发给服务端（opcode 10032），顺便更新本地缓存。
+-- 注意取 service 的方式：本工程**没有全局 getInstance**
+-- （踩过：SiteGamePageWidget.lua:119 "attempt to call global
+--  'getInstance' (a nil value)"），BaseWidget 也没有 getInjector。
+-- 正解是类头的 `has("_dbgSvc"):injectWith("DebugBoxService")`，
+-- 和这个文件里其它注入（:16-33 的 _siteSystem/_heroSystem ...）同一套。
+function _YQLR_CFG_SET(svc, name, index)
+\tlocal vals = _YQLR_CFG_VALUES()
+\tlocal raw
+
+\tif _YQLR_CFG_INDEX[name] ~= nil then
+\t\traw = _YQLR_CFG_INT_VALUES[index + 1] or "0"
+\t\t_YQLR_CFG_INDEX[name] = index
+\telse
+\t\traw = (index == 1) and "false" or "true"
+\t\tvals[name] = (raw == "true")
+\tend
+
+\tif not svc then
+\t\tprint("[YQLR] DebugBoxService 未注入，配置未下发")
+
+\t\treturn
+\tend
+
+\tsvc:requestTest({ "debugConfig", name, raw }, function (response)
+\t\tlocal tip = "配置已下发"
+
+\t\tif response and response.data and type(response.data) == "string" then
+\t\t\ttip = response.data
+\t\tend
+
+\t\tprint("[YQLR] debugConfig " .. name .. "=" .. raw .. " -> " .. tip)
+\tend)
+end
+''' % (
+        '\n'.join('\t\t%s = %s,' % (n, ('true' if n in _BOOL_DEFAULT else 'false'))
+                  for n, k, _g, _d in DEBUG_TOGGLES),
+        '\n'.join('\t%s = 0,' % n for n, k, _g, _d in DEBUG_TOGGLES if k == 'int'),
+    )
+
+    INJECT = PRELUDE + '''
+-- [YQLR] 把服务端配置项追加进游戏设置页的列表数据。
+-- 复用 initSiteList 的完整渲染逻辑，外观/排版/音效与原设置项一致。
+function SiteGamePageWidget:getYqlrServerCfg()
+\tlocal data = {}
+
+%s
+
+\treturn data
+end
+
+''' % rows_src
+
+    # ------------------------------------------------------------------
+    # 取 service 的正确方式。
+    #
+    # 本工程**没有全局 getInstance**（实测
+    # "SiteGamePageWidget.lua:119: attempt to call global 'getInstance'
+    # (a nil value)"），BaseWidget 也**没有 getInjector**
+    # （BaseWidget 只有 getView/getChildView/setVisible/... 十几个方法）。
+    # 正解是类头的 has/injectWith，和这个文件里其它注入
+    # （:16-33 的 _siteSystem / _heroSystem / ...）完全同一套。
+    # ------------------------------------------------------------------
+    CLASS_DEF = 'SiteGamePageWidget = class("SiteGamePageWidget", BaseWidget)\n'
+    assert src.count(CLASS_DEF) == 1, 'SiteGamePageWidget 类定义未唯一匹配'
+    src = src.replace(CLASS_DEF, CLASS_DEF
+                      + '\n-- [YQLR] 取 DebugBoxService（opcode 10032 指令通道）\n'
+                      + 'SiteGamePageWidget:has("_dbgSvc", {\n'
+                      + '\tis = "r"\n'
+                      + '}):injectWith("DebugBoxService")\n')
+    print('    [设置页] 已注入 DebugBoxService')
+
+    if src.count(ANCHOR) != 1:
+        print('    [设置页] return GameSiteConfig 未唯一匹配（%d 次），跳过'
+              % src.count(ANCHOR))
+        return src
+
+    # ------------------------------------------------------------------
+    # 先修一处**反编译器的错误还原**，否则整个设置页（含游戏原有设置项）
+    # 都会崩，跟我们加的配置项无关。
+    #
+    # 反编译产物（SiteGamePageWidget.lua:290）：
+    #     initVal = (type(initFunc) ~= "function" or initFunc(userSite))
+    #               and (initFunc or 0)
+    # Lua 里 0 是**真值**，所以只要 initFunc(userSite) 返回任何数字
+    # （原表返回 0/1/2 都属于此列），`X and (initFunc or 0)` 就取到
+    # **函数本身**，随后 list:setSelectedIndex(函数) 直接报
+    #     "invalid arguments in function '..._GList_setSelectedIndex'"
+    #
+    # 原字节码的语义显然是"是函数就调用它，否则用配置里的默认值"，即
+    #     initVal = type(initFunc) == "function" and initFunc(userSite)
+    #              or initFunc or 0
+    # 但这个写法在 initFunc 返回 nil/false 时同样会掉到 `or initFunc`
+    # 拿到函数对象，所以直接写成无歧义的 if/else，不赌反编译器。
+    #
+    # **教训**：把反编译源码重新编译成 luac 时，反编译器自身的还原错误
+    # 会被固化进产物 —— 语法检查（luajit loadfile）**发现不了**这类
+    # 语义改变，只会在设备上运行时炸。凡是要重编译的文件，
+    # 都要留一条"这份源码能不能自洽跑起来"的验证路径。
+    # ------------------------------------------------------------------
+    BAD_INIT = ('\t\tinitVal = (type(initFunc) ~= "function" or initFunc(userSite))'
+                ' and (initFunc or 0)\n')
+    GOOD_INIT = ('\t\t-- [YQLR] 原式 (type(initFunc) ~= "function" or initFunc(userSite))\n'
+                 '\t\t-- and (initFunc or 0) 是反编译器的错误还原：Lua 里 0 为真，\n'
+                 '\t\t-- 任何数字返回值都会让表达式取到函数本身，\n'
+                 '\t\t-- 随后 setSelectedIndex(函数) 报 invalid arguments。\n'
+                 '\t\t-- 这里改写成无歧义的 if/else。\n'
+                 '\t\tif type(initFunc) == "function" then\n'
+                 '\t\t\tinitVal = initFunc(userSite)\n'
+                 '\t\telse\n'
+                 '\t\t\tinitVal = initFunc or 0\n'
+                 '\t\tend\n')
+    if src.count(BAD_INIT) == 1:
+        src = src.replace(BAD_INIT, GOOD_INIT)
+        print('    [设置页] 已修正 initVal 的反编译还原错误'
+              '（否则整个设置页都会崩）')
+    else:
+        print('    [设置页] !! initVal 那行未匹配（%d 次），'
+              '设置页可能仍会崩，请手工核对' % src.count(BAD_INIT))
+
+    src = src.replace(ANCHOR, '\t-- [YQLR] 追加离线服服务端配置项\n'
+                    '\t-- 逐条 table.insert，**不用 table.unpack**：\n'
+                    '\t-- 宿主是 LuaJIT 2.1（Lua 5.1），没有 table.unpack，\n'
+                    '\t-- 只有全局 unpack —— 实测报\n'
+                    '\t--   "SiteGamePageWidget.lua:603: attempt to call \'unpack\' (a nil value)"\n'
+                    '\tlocal _yqlrCfg = self:getYqlrServerCfg()\n\n'
+                    '\tfor _i = 1, #_yqlrCfg do\n'
+                    '\t\ttable.insert(GameSiteConfig, _yqlrCfg[_i])\n'
+                    '\tend\n\n'
+                    + ANCHOR)
+
+    # 把辅助函数插在 getSiteGameData 定义之前
+    DEF = 'function SiteGamePageWidget:getSiteGameData()\n'
+    assert src.count(DEF) == 1, 'getSiteGameData 定义未唯一匹配'
+    src = src.replace(DEF, INJECT + DEF)
+
+    print('    [设置页] 已注入 %d 个服务端配置项（复用 initSiteList 渲染）'
+          % len(DEBUG_TOGGLES))
+    return src
+
+
+# 各 bool 开关的默认值，必须和服务端 rrcp_server.py 里类属性的初值一致，
+# 否则面板显示会和服务端实际状态不符（服务端没有读接口，兜底只能靠这里）。
+_BOOL_DEFAULT = {
+    'HERO_UNLOCK_ALL', 'HERO_MAX_LEVEL', 'HERO_MAX_RANK', 'HERO_MAX_STAR',
+    'HERO_MAX_BEYOND_UP', 'HERO_UNLOCK_RESOURCES', 'RESOURCE_INFINITE',
+    'RESOURCE_PLAYER_CURRENCY',
+}
+
+
 PATCHERS = {'sdk/SDKHelper.luac': patch_sdkhelper,
              'yq/base/Service.luac': patch_service,
+             'yq/gameplay/home/view/HomeCenterWidget.luac': patch_homecenterwidget,
              'yq/gameplay/playerLevel/controller/PlayerLevelSystem.luac': patch_playerlevelsystem,
              'yq/launch/login/LoginSystem.luac': patch_loginsystem,
              'yq/launch/login/view/LoginMediator.luac': patch_loginmediator,
@@ -1703,6 +2975,10 @@ PATCHERS = {'sdk/SDKHelper.luac': patch_sdkhelper,
              'yq/assets/GameStyle.luac': patch_gamestyle,
              'yq/assets/dmAudio.luac': patch_dmaudio,
              'yq/gameplay/hero/view/HeroInfoMediator.luac': patch_heroinfomediator,
+             'yq/debug/debugBox/view/DebugModule.luac': patch_debugmodule,
+             'yq/debug/debugBox/view/DebugBoxMediator.luac': patch_debugboxmediator,
+             'yq/gameplay/site/view/SiteGamePageWidget.luac': patch_sitegamepagewidget,
+             'yq/gameplay/base/UrlEntry.luac': patch_urlentry,
                      'yq/gameplay/activity/model/ActivityList.luac': patch_activitylist}
 
 # ---------------------------------------------------------------- 主流程

@@ -2213,3 +2213,992 @@ offline_server.lua，用 luajit 加载后直接调 `build_response`，校验
 观测到的请求序列：`10001 → 10010 → 10037 → 19002 → 35001 → 41001`
 （其中 10037 / 35001 表里没有，走 `default` 兜底，日后按需补）。
 **还差**：14002 战斗生成（目前只有 C00S01 写死那份）、抽卡 15001。
+## 47. 主屏助理切换后语音不变：opcode 10038 缺失（20:05 ~ 20:08）
+
+现象：设置里把主屏助理从 A 换成 B，**画面变了但语音还是 A 的**。
+
+### 47.1 定位链条（每一步都有源码出处，不猜）
+1. `HomeCenterWidget:562 getCurScreenHeroInfo()` -> `Player:getScreenHero()`
+   （`Player.lua:339-346`）只读 `_mainScreenType` / `_mainScreenHeroId`。
+2. 这两个字段**只**在 `BasePlayer:synchronizeInfoDiff` 里被写
+   （`BasePlayer.lua:224-230`），调用点是 `DevelopSystem:syncPlayer`（`:93`）。
+3. `syncPlayer` 的数据来自 `data.d.player`，来源只有两处：
+   `PushSystem`（推送）和 `Service.lua:71-77`（**任何** GS_SUCCESS 应答里
+   只要有 `response.d` 就派发 `EVT_SYNCHRONIZE_DIFF`）。
+4. 所以：切换动作必须由服务端回一个 `d.player` diff，否则字段不变。
+5. 切换动作的 opcode：`HomeCenterWidget:771` -> `CustomDataSystem:ChangeHero`
+   （`CustomDataSystem.lua:112-123`）-> `CustomDataService:requestChangeHero`
+   -> `opType.changeHero = 10038`（`CustomDataService.lua:2-7`）。
+6. **`10038` 不在服务端表里**，走 `default` 空应答 -> diff 缺失。
+
+### 47.2 为什么画面会变而语音不会
+画面是三个 tab 回调直接换模型：`SelectPanelWidget` 的
+`clickItem` 调 `self._callBackTable[screenType](heroId)`
+（`SelectPanelWidget.lua:39-47`），对应
+`HomeCenterWidget:754-790` 的 `live2dCallBack` / `spineCallBack` /
+`illustrationCallBack` -> `changeLive2d` / `changeSpine` /
+`changeIllustration`。这**不经过 Player**。
+而语音三处（`HomeCenterWidget:591` / `:611` / `:830`）都读
+`getCurScreenHeroInfo()`，走 Player 拿旧 heroId -> 播旧角色。
+这就是"模型换了、Player 没换"的分裂。
+
+### 47.3 resourceType 的含义（不是猜的）
+`resourceType` = `HomeCenterWidget:718 self._selectHeroType = pageName`，
+即 fgui tab 的页名。合法值只有三个（`SelectPanelWidget.lua:10-12`）：
+`Por_Spine` / `L2D` / `Illustration`，与 `getScreenHero()` 的
+`screenType` 是同一套字符串。
+
+### 47.4 修法
+服务端加 10038 分支，回 `d.player = {mainScreenHeroId, mainScreenType}`；
+同时 10001 也下发这个值，否则重连会被表内初值（`LaJ` / `Por_Spine`）盖掉。
+落盘到 `main_screen_state.json`（照 `guide_state.json` 的写法），
+mock 重启不该把玩家选的角色打回初值。
+
+### 47.5 两个防护（都是因为客户端 JSON 会带坏字节）
+沿用 15001 的教训：按字节正则抽参数，不依赖整体 `json.loads`。
+- `heroId` 不在 `Character.tsv` -> 拒绝并保留上一个有效值。
+  脏值（如 `'AnWZ\x01\n'`）绝不能写进玩家数据。
+- `resourceType` 不在三个合法值里 -> 沿用当前形态。
+- 但**整体 JSON 坏、heroId 本身干净**时必须照样抽出来，
+  否则又是"客户端明明换了、服务端按旧值应答"。
+
+### 47.6 版本与验证
+`CODE_VERSION` 升到 `r36-mainhero-20261009`。
+新增 `E:\Test\Temp\yqlr\_out_rrcp\test_changehero_10038.py`，
+13 项断言全过（A->B、10001 带回、只切形态、形态缺失沿用、
+非法形态、非法 heroId、JSON 坏但 heroId 干净、脏 heroId 被拒、落盘）。
+
+**踩坑**：`build_response` 返回的是**线上帧 bytes**，不是 dict。
+帧布局 `u8 kind | u8 0 | i32 req_id | q ts | i32 0 | h 0 | u32 len | body`
+-> 长度字段在偏移 **20**，body 从 **24** 开始（我先按 19/23 算，连错两次；
+是直接探测 `wire.find(b'{')` 才定下来的，不要再凭手算）。
+
+## 48. 调试面板：在线改服务端配置（20:22 ~ 20:45）
+
+目标：做一个调试用活动，点进去能改服务端配置，Python mock 和内置 Lua offline 都要能响应。
+
+### 48.1 关键发现：不用自己造面板，opcode 10032 早就有了
+游戏自带调试面板 `DebugBox`（`yq/debug/debugBox/`），并且**已经有服务端指令通道**：
+- `DebugBoxService.lua:2-5`  `OPCODE_DATA_MODIFICATION = 10032`，
+  `requestTest(params)` 发的体是 `{cmd = params}`。
+- `DebugBoxMediator.lua:180-221` 把面板上的一条命令组装成
+  `{FuncName, 参数1, 参数2, ...}`，然后 `requestTest` 发出去。
+- `DebugBoxMediator.lua:122` 命令表来自 `require("...DebugModule")`，
+  即 `yq/debug/debugBox/view/DebugModule.lua` 返回的 `modules` 表。
+- 命令项 `{FuncName, FuncDesc, param}`：不填 `isLocal` = 走服务端；
+  `param` 的每个名字在面板上是一个输入框，点"真"把文本原样发出。
+- 应答里的 `d.player` 会走 `Service.lua:71-77` 自动同步回客户端，
+  所以服务端改完直接回一整份新 player 就能看到效果。
+
+### 48.2 服务端：这些开关本来就是 Server 的类属性
+`apply_hero_config` / `apply_resource_config` / `apply_ladder_config` 里读的是
+`Server.HERO_MAX_STAR` 这类**类属性**。所以运行时 `setattr` 就够，
+**不用改 apply_*() 里的任何一行**，改完重跑对应的 `apply_*()` 重新生成
+`table['10001']` 即可。白名单 `Server.DEBUG_TOGGLES` 共 19 项（角色/资源/天梯）。
+
+**刻意不开放**（改了会把客户端打崩，理由在各自 apply_*() 的注释里）：
+`HERO_PERSONALITY_MAP`（HeroInfoMediator:1478 等 7 处无保护读取，必须 True）、
+`HERO_PERSONALITY_KEYS`/`HERO_RESOURCE_KEYS`（结构键）、
+`HERO_KEEP_EXISTING`（内部实现）、`RESOURCE_PAGES`/`RESOURCE_EXCLUDE_TYPES`、
+`LADDER_TYPES`/`LADDER_REWARD_TSV`。
+
+落盘到 `debug_config.json`，**必须在 `load_table()` 之后、所有 `apply_*()` 之前**载入，
+否则读的还是默认值。默认值快照 `DEFAULTS` 取自模块末尾（类定义跑完后立刻取，
+再往后就被 `load_debug_config()` 覆盖了）。
+
+### 48.3 调试活动为什么要"注入配置行"，光下发 ActivityData 不够
+`ActivityList:syncAloneActivity`（`:27-42`）拿 id 去
+`ConfigReader:getRecordById("Activity", id)` 查配置行，**查不到整条活动被静默丢弃**
+（`if config then` 的 else 分支什么都不做）。
+所以要两边配套：
+1. 服务端在 `datas.ActivityData` 下发 `Activity_Debug_Config`
+   （`apply_debug_activity`，字段含义对齐 `BaseActivity:synchronize:40-67`）。
+2. 客户端在 `syncAloneActivity` 里调 `ensureDebugActivityConfig()`，
+   往 ConfigReader 的 Activity 表塞一行。
+   - `ConfigReader._Tables` 就是普通 Lua 表（`ConfigReader.lua:125`
+     `return dataTable and dataTable[id]`），可以安全写。
+   - 注入点选在 `ActivityList` 而不是 `ConfigReader`：前者已在补丁清单里，
+     不需要新增资源条目；后者是全局热点，不去碰。
+   - `Type = "Meaningless"` 走 `MeaninglessModel`，它只是 BaseActivity 的空壳
+     （全文 9 行，只有 initialize/synchronize），不会去读一堆没下发的子表。
+   - `Link = "view://debugBoxView"` -> `ActivityMediator:104` 的
+     `enterViewByUrl(cfg.Link)`。`DebugBoxView`/`DebugBoxMediator` 在
+     `modules.lua:192-193` 已注册。
+   - `YQLR_DEBUG_ACTIVITY=0` 可关。
+
+### 48.4 新增补丁资源：DebugModule.luac
+`DebugModule` 原本不在补丁清单里，需要自己算 tagpath。**推导规则**：
+    tagpath = assets/release/<md5[0:2]>/<md5[2:4]>/<md5[4:]>.luac
+md5 取 **decrypted_all 里的原始 .luac**。本次：
+    DebugModule.luac md5 = 86508af6...  ->  assets/release/86/50/8af682...luac
+（已在 APK `yqlr_v5_dev.apk` 的 zip 条目里核对存在。）
+**注意** `patch_manifest.json` 里的 `md5` 字段是**另一回事**，不是这个 hash。
+
+### 48.5 踩坑：往表字面量里插 = 语法错误
+第一版往 `local modules = {` 后面插新组，漏了组前和与原第一组之间的逗号，
+产出 `{ , {...} {...} }` —— luajit 编译**居然没报错**，但表结构是错的。
+改成 `table.insert(modules, {...})` 追加到 `return modules` 之前才干净。
+**教训**：这类拼接一律用 `table.insert`，别手补逗号；改完必须
+`luajit -e "loadfile(...)"` 单独验一次语法，不能只看构建脚本报没报错。
+
+### 48.6 Lua 侧的硬约束（所以 10032 在 offline 是拒绝而不是半实现）
+offline 的应答体是**构建期 json.dumps 好的字符串**（MEMORY 46.2：Lua 侧一次都
+不能重新编码，cjson 往返会把 5 处空数组 `[]` 变成 `{}`）。
+- 能改的只有**标量字段**，用占位符 + `gsub` 是安全的。
+- 改不了的：`LADDER_ORDER`（要重算整棵 typeData）、
+  `HERO_MAX_STAR`（要**删** `"starId":"xxx_N"` 字段）。
+- 真要支持就得把 `apply_*()` 连同 TSV 读取整个移植到 Lua。
+所以 offline 的 10032 返回 `resCode:1` + 明确说明，**好过静默走 default
+空应答让人以为改了**。
+
+offline 侧已经补上的：`10038`（同 47 的 diff 机制）+ `mainScreenHeroId`/
+`mainScreenType` 两个占位符（`__YQLR_MAINHERO__` / `__YQLR_MAINTYPE__`），
+状态与 Python 共用 `/sdcard/main_screen_state.json`，两种服务端之间切换不丢选择。
+
+### 48.7 踩坑：Lua 的 string.find 不给捕获组
+`string.find(s, '"heroId"%s*:%s*"([^"]*)"')` 返回的是**整个匹配**的起止位置，
+`string.sub(raw, a+1, b)` 会把 `"heroId":` 一起截进去 —— 实测抽出过
+`'heroId":"BaiJ'` 这种脏值，还被写进了玩家数据。**必须用 `string.match`**。
+Python 侧的正则 `re.search(...).group(1)` 没这个问题。
+
+### 48.8 版本与验证
+`CODE_VERSION` -> `r37-debugcfg-20261009`。
+- `test_debugcfg_10032.py`（新建）36 项断言全过：cmd 解析、关/开满星后
+  `d.player` 真的变、资源数量、满好感、天梯、非白名单被拒且不污染类属性、
+  int 收到 `abc` 被拒且不写坏配置、`int` 开关的 0 归一成 None、
+  参数不足、`addHero` 明确报未实现、落盘、重启载入、陌生键不崩、reset。
+- `test_rsp_offline.py` 加了 10038 / 10001 带回 / 非法形态沿用 / 10032 拒绝，
+  luajit 实跑通过，占位符无残留。
+- 两边白名单一致性：`gcheck` 脚本比对 `Server.DEBUG_TOGGLES` 与
+  `build_patched_luac.py` 的 `DEBUG_TOGGLES`，19/19 完全一致（含类型）。
+- dev 包已签名安装（20:37）。**设备实测待做**。
+
+## 49. 排查"连不上服务端"：adb reverse 会自己丢（20:47）
+
+现象：客户端突然连不上服务端，但 8888 上 mock 进程活着、logcat 里也没有网络错误。
+
+**第一步就查 `adb reverse --list`** —— 这次是**空的**。模拟器/设备重连后
+adb 的 reverse 映射会被清掉，而客户端连的是 `127.0.0.1:8888`（设备自己的
+localhost，靠 reverse 转到宿主），映射没了就必然连不上。
+重建即可：
+    adb -s 127.0.0.1:5555 reverse tcp:8888 tcp:8888
+
+**判断依据**（下次直接照这个顺序查）：
+1. 宿主 `Get-NetTCPConnection -LocalPort 8888 -State Listen` -> 有监听？
+2. `adb reverse --list` -> **空就是它**（最常见，且最容易被忽略，
+   因为 mock 进程明明活着、日志明明有历史记录）。
+3. mock 日志末尾有没有**新的** REQ 行 -> 没有新行 = 请求根本没到宿主，
+   问题在连接层而不是协议层；有新行但没 RESP = 服务端处理的问题。
+4. logcat 筛 `cocos2d-x debug info` -> 只有 `[CSM] [W]RotationDeformer`
+   这类是 L2D 动画的正常噪声，不是错误。
+
+**注意**：每次重启模拟器、重新 `adb devices` 之后都要补一遍 reverse，
+建议把它并进固定的启动检查步骤。
+
+## 50. 「限时活动」弹窗：从白板到可用（21:00 ~ 22:02）
+
+三个独立问题叠在一起，逐个拆的。**教训：每层都有独立的判据，
+不能只看上一层「我以为已经生效了」。**
+
+### 50.1 第一层：入口是我们自己禁用的
+主页右上角第一个图标（秒表样式）= `HomeCenterWidget:KRightListData[1]`：
+`btnType = "Banner"`, `funcCallback = "bannerCallback"`, `icon = "main_icon_09"`。
+上一轮为了绕开「空白弹窗」，`patch_homecenterwidget` 把
+`bannerCallback` / `showActivityList` 都改成 `if true then return end`，
+所以点它**毫无反应、也不发任何包**。
+已把 `YQLR_NO_ACT_POPUP` 默认值从 1 改成 0（入口默认保留）。
+
+### 50.2 第二层：白板的真因是「两个条件同时不满足」
+弹窗内容由 `ActivityMediator:145-156` -> `BannerSystem:41-59` 决定：
+    1. activity:getIsTodayOpen() == 1   <- BaseActivity:53 读 data.status
+    2. activityCfg.Icon ~= "" 且 Icon[1].ListRes 非空
+原来表里那 3 个活动（Activity_MainLineFund / Activity_TowerFund /
+Activity_Deposit）**都没带 status** -> `getIsTodayOpen()` 恒为
+`STATUS_INIT(0)`，一个都进不了 banner 列表 -> 白板。
+新增 `apply_banner_activity()`，下发 3 个 Activity.tsv 里**真实存在**的
+Limit 类活动（Activity_CharUpgrade / Activity_PVP / Activity_StarField1），
+status=1 + ListRes 非空。选它们是因为 LimitActivityMode 只是 BaseActivity
+的空壳（21 行），且 Config 指向的 ActivityConfig 行都存在
+（`BaseActivity:_getActivityConfig:157` 对缺失 configId 是 assert）。
+
+### 50.3 第三层：**ActivityData 必须嵌套一层 activities**
+这是排查最久的一个。服务端日志明明显示数据已下发、status=1 也对，
+客户端就是一条活动都没有。
+`DevelopSystem.lua:262-263` 要的是：
+    if otherDatas and otherDatas.ActivityData
+       and otherDatas.ActivityData.activities then
+     self:getActivityList():synchronize(otherDatas.ActivityData.activities)
+我下发成了**扁平**的 `ActivityData: {活动id: {...}}`，
+`and ....activities` 直接短路 -> `synchronize` 一次都没被调用
+-> status 读不到 -> getIsTodayOpen() 恒 0 -> banner 列表恒空。
+**`opcodes_table.json` 里 `datas.ActivityData` 那条注释早就写明了
+`.activities` 形状，是我没核对就按扁平写了。**
+连带把原来顶层那 3 个占位活动搬进了 `activities`（否则顶层残留同 id 副本）。
+
+### 50.4 第四层：写 ConfigReader 没用，必须写 DataReader 的缓存
+调试活动的配置行 `Activity_Debug_Config` 不在 Activity.tsv 里，
+`syncAloneActivity` 查不到就静默丢弃（`if config then` 的 else 什么都不做）。
+想运行时注入，但踩了两轮：
+    ConfigReader.lua:14   isUseDBReader = true
+    => ConfigReader:getRecordById / getDataTable 全部转发给 DataReader
+    DataReader:getDataTable(:138-152) 每次调用都**新建一个 temp 表**
+       （还要过 `if value ~= false` 过滤），返回的是**临时副本**
+    => 往它的返回值里写 tbl[id] = {...}，下次读拿到的是另一个副本，写入丢失
+正解：直接写 `DataReader._cacheDataTable["Activity"][id]`。
+`DataReader` 是**全局表**（DataReader.lua:1-17），不是 injector 实例。
+（`_getRecordById:110-112` 查不到时还会把 false 写进缓存，一并要注意。）
+
+### 50.5 第五层：调试活动点了会崩（UrlEntry 路由）
+点调试活动 -> `UrlEntry.lua:343: attempt to index a nil value`。
+链路：ActivityMediator:103-110 -> UnlockSystem:294 enterViewByUrl ->
+:284 openViewEventByUrl -> EVT_OPENURL ->
+biubiu/legs/core/command/OpenUrlCommand:4-25 ->
+`UrlEntryManage.resolveUrlWithUserData`
+该函数查找有两级（:304-313）：
+    1. `mapping = getURLMappingEntries()`  -- **可写的普通 Lua 表**
+    2. mapping[page] 为空才 fallback 到 `kExtResponseMap[viewName].entry`
+debugBoxView 两边都没有，:310 直接索引 nil。
+讽刺的是 :313 的 assert 和 OpenUrlCommand:9-16 的「功能未开放」提示
+**本来就是干净的兜底**，但崩在它们前面，永远到不了。
+正解：往第 1 级表加一条（`patch_urlentry`），DebugBoxView 在
+modules.lua:192-193 已注册，只差这条路由。
+
+### 50.6 Icon 也不能留空
+一开始注入的配置行写了 `Icon = ""`，结果活动出现了但**弹窗里看不到它** ——
+这个弹窗是**唯一**的活动列表，不存在另一条不依赖 Icon 的显示路径。
+`ActivityMediator:100` 用 `icon:setURL(kBannerIcon .. cfg.icon[1].ListRes .. ".png")`，
+`kBannerIcon = "asset/lang_banner/"`（GameTypesCfg.lua:898）。
+复用 `main_show_19_m`，已确认
+`asset/lang_banner/main_show_19_m.png` 在 decrypted_all 里真实存在
+（**复用前务必核对文件真的在，别靠猜**）。
+
+### 50.7 新增补丁资源的 tagpath 推导
+新加 `yq/gameplay/base/UrlEntry.luac` 时按 48.4 的规则算：
+    tagpath = assets/release/<md5[0:2]>/<md5[2:4]>/<md5[4:]>.luac
+md5 取 `_out_conf/decrypted_all` 下的原始 .luac（本次 7544/3109cc35...）。
+**注意逻辑名 ≠ 目录名**：modules.lua 里注册的是
+`yq.gameplay.base.UrlEntry`，而目录是 `yq/gameplay/base/`（不是 `yq/base/`）。
+找不到反编译工具时，`_out_decompile/samples/net_UrlEntry.lua` 有现成源码可用。
+
+### 50.8 ⚠️ 部署顺序（有硬依赖，踩了两次）
+`install -r` 会把 `files/assets.db` **覆盖回 APK 内的 4 MB 原始版**，
+而 `patch_runtime_db.py` 生成的是 **7.98 MB 运行时库**
+（`dmAudio` 等只存在于运行时库里）。不重推就会报
+`module 'yq.assets.dmAudio' not found`，客户端起不来。
+另外 `adb root` / `adb unroot` 都会**重启 adbd 并清掉 reverse 映射**。
+所以正确顺序固定为：
+    build_patched_luac -> rebuild_v5 -> zipalign -> apksigner
+    -> install -r -d
+    -> adb root -> patch_runtime_db.py -> adb unroot   # 必须在 install 之后
+    -> adb reverse tcp:8888 tcp:8888                   # 必须在 root 之后
+    -> 重启 mock -> 启动客户端
+**已把这套固化成 `D:\Temp\yqlr\_out_repack\deploy_dev.ps1`（7 步，含校验），
+以后直接跑它，不要手工一步步来。**
+（脚本必须是纯 ASCII：PS 5.1 按 ANSI 读 UTF-8 无 BOM 文件，中文会变乱码
+并导致语法错误。）
+
+### 50.9 自测的教训
+`test_banner_activity.py` 最初只断言「数据已下发、status=1、ListRes 非空」，
+**全是服务端视角**，所以 50.3 那个层级错误它一条都测不出来。
+现在第一件事就是断言 `ActivityData.activities` 这层存在（层级错了后面
+断言全无意义），外加一条「防再次摊平」的对照断言。
+**凡是「客户端会不会读」的判据，都要写进自测，不能只测自己下发了什么。**
+探针（`[ACT]` 写 /sdcard/rp.txt）这次帮了大忙：它一行就证明
+`syncAloneActivity` 到底被调用没有、status 和 ListRes 读到了没有。
+
+## 51. Debug GUI 重构：挂进游戏设置页（11:20 ~ 12:12）
+
+需求是"重写一份**与游戏一致**的 Debug GUI"。第一版做错了方向，纠正记录在此。
+
+### 51.1 走错的方向：复用 DebugBox 面板
+最初把 19 个开关塞进游戏自带的调试面板 `DebugBox`（`ui://DeBugBox/BoxView`），
+用它的 `type="params"` 分支（`DebugBoxMediator.lua:154-176`）渲染成下拉。
+功能没问题，但外观不对 —— 渲染出来是蓝底 + 白色默认色块。
+**证据**：`What's your dream?` 就是 `DeBugBox.fui` 里的原文标题（实测该字符串
+在文件里），整个包 7275 B、**不引用任何图集** —— 它本来就是游戏自带的
+**无美术开发面板**，不是渲染失败。
+教训：看到"无样式"先分辨是"组件没取到"还是"本来就长这样"，
+别急着往加载失败方向查（我为此白查了一轮 fgui/UrlEntry/DataReader）。
+
+### 51.2 正确方向：一行 UI 代码都不写，复用设置页渲染链
+游戏真正的设置页是 `ui://Site/SiteMainView`（`SiteMainMediator`），
+其中"游戏设置"那层的渲染器是 `SiteGamePageWidget`：
+- `getSiteGameData()`（:61-251）是**纯数据函数**，返回一组设置项描述
+- `initSiteList()`（:253-357）是它的通用渲染器，已完整处理三种行：
+    type="list"      下拉（:292-322）setItemRenderer/ClickItem -> selectCb
+    type="slider"    滑条（:324-344）
+    type="voiceList" 自定义 widget（:346-351）
+  每行还有 `obj:getController("mode"):setSelectedPage(nodeType)`（:282-284）
+  和 `obj:setTitle(Strings:get(config.title or config.name))`（:285）
+
+所以只要在 `return GameSiteConfig`（:250）前把我们的行 table.insert 进去，
+**外观/排版/点击音效/红点/选中态全部天然一致** —— 用的就是同一套渲染代码
+和同一个 fgui 组件。新增 `patch_sitegamepagewidget` 就是干这一件事。
+调试活动入口的 Link 也随之改成
+`view://siteMainView&viewType=push&type=siteGame`
+（`FunctionUnlock.tsv` 里 `Setting_System` 用的就是这个值）。
+
+行数据形状（对齐 :64-88 的 gameSiteAni）：
+    { name=, type="list", index=, title=, enable=true, values={...},
+      selectCb=function(index) ... end,   -- 玩家改动
+      initFunc =function(userSite) ... end }  -- 当前值，返回下标
+
+### 51.3 新增补丁目标：SiteGamePageWidget.luac
+tagpath 按 48.4 的规则算（md5 取 `_out_conf/decrypted_all` 下原始 .luac）：
+    yq/gameplay/site/view/SiteGamePageWidget.luac
+    md5 = 19424521a05635353cc60752e027
+    tagpath = assets/release/19/15/19424521a05635353cc60752e027.luac
+（已在 APK zip 条目里核对存在。反编译源码本来就有，14538 B。）
+
+### 51.4 踩坑：`table.unpack` 在本工程不存在
+写法 `table.insert(GameSiteConfig, table.unpack(self:getYqlrServerCfg()))`
+直接报：
+    SiteGamePageWidget.lua:603: attempt to call 'unpack' (a nil value)
+**宿主是 LuaJIT 2.1（Lua 5.1）**，没有 `table.unpack` / `table.pack` /
+位运算这些 5.2+ 扩展，只有全局 `unpack`。
+**luajit loadfile 的语法检查抓不到这个** —— 它是运行时才炸的。
+改成逐条 `table.insert` 循环。
+
+### 51.5 踩坑（更重要）：反编译器的还原错误会被固化进产物
+`initSiteList` 里那行反编译产物是：
+    initVal = (type(initFunc) ~= "function" or initFunc(userSite)) and (initFunc or 0)
+**这是错的还原**。Lua 里 `0` 是**真值**，所以只要 `initFunc(userSite)` 返回
+任何数字（原表返回 0/1/2 全在此列），`X and (initFunc or 0)` 就取到
+**函数本身**，随后 `list:setSelectedIndex(函数)` 报
+    "invalid arguments in function '..._GList_setSelectedIndex'"
+原字节码的语义显然是"是函数就调它，否则用配置默认值"。
+**注意：这不是我们加的配置项引起的** —— 游戏原有那 20 多个设置项同样会崩；
+是"反编译源码 → 重新编译成 luac"这个动作把反编译器自己的错误固化了。
+改成无歧义的 if/else。
+**教训**：凡是会被重新编译的文件，都要留一条"这份源码能不能自洽跑起来"的
+验证路径。语法通过 != 语义正确，`and/or` 这类表达式最容易中招。
+
+### 51.6 踩坑：没有全局 `getInstance`，BaseWidget 也没有 getInjector
+写 `_YQLR_CFG_SET` 时用 `getInstance("DebugBoxService")`，报
+    SiteGamePageWidget.lua:119: attempt to call global 'getInstance' (a nil value)
+- 全局 `getInstance` 在本工程**不存在**
+- `BaseWidget` 只有 getView / getChildView / setVisible / dispatchEvent /
+  autoManageObject 等十几个方法，**没有 getInjector**
+正解是类头注入，和该文件里其它 6 个注入（`_siteSystem` / `_heroSystem` / ...）
+同一套：
+    SiteGamePageWidget:has("_dbgSvc", { is = "r" }):injectWith("DebugBoxService")
+类定义锚点是 `class("SiteGamePageWidget", BaseWidget)`（**没有 `, _M`**，
+写锚点时别照抄别的文件的写法）。
+
+### 51.7 `Strings:get` 查不到会原样返回 id
+`Strings.lua:53-58`：`find(id)` 返回 nil 时 `get` 直接 `return id`。
+所以配置项的 title 和下拉项用中文原文即可，**不需要往 Text 表加文案**。
+（对照：`initSiteList:285` 和 `:305` 都会走 `Strings:get`。）
+
+### 51.8 已知限制：服务端只有写、没有读
+opcode 10032 只实现了 `debugConfig <名> <值>` 和 `debugConfigReset`，
+**没有查询接口**。所以面板显示的当前值是本地缓存
+（`GameConfigs.DebugCfgValues`，bool 的初值表 `_BOOL_DEFAULT` 必须和
+`rrcp_server.py` 里类属性的初值一致，否则显示与服务端实际状态不符）。
+代价：**重启 mock 后面板显示是陈旧值**，需要手动切一次。
+后续可加一个 `debugConfigQuery` 读接口解决。
+
+
+## 52. 主线战斗 / 天梯「资源勘探」全链路（r39 ~ r59，12:40 ~ 15:45）
+
+这一段全是"客户端因为服务端少给了某个字段而崩/锁死"的连锁坑。共同教训：
+**报错行号和反编译源码行号对不上时，先在反编译源码里找同名函数**，
+不要照着 luac:NNN 硬找。
+
+### 52.1 战斗数据缺 `body` -> 召唤必崩（r58）
+- 现象：`cannot summon id:DuoLNN_Summoned1`
+- 召唤数据不是服务端直接给的，是客户端**现算**的：
+  `BattleDataParser:288 fillOtherHeroData(heroData.body, otherData)`
+  -> `:292-320` 拿每个 id 去 `getBattleRecordById("Enemy", unitId)` 查配置
+  -> 组出单位数据存进 `others`；之后 `special_ops:9-11` 走
+  `copySummonData`（`BattlePlayer:72-76` = `self._others[id]`）
+- 我们不下发 `body` -> `heroData.body` 是 nil -> `:293` 的
+  `if type(unitIds) == "table"` 不成立 -> `others` 恒空 -> assert 崩。
+- 修法：`_hero_base()` 加 `body` 参数，取配置表 `ChangeBody` 列
+  （Character.tsv / Enemy.tsv 都有）。`DuoLNN_Summoned1/2` 确实是
+  Enemy 表的 rowId，所以客户端查得到。**顺带修掉主线 203 关里 45 关的同类隐患。**
+- 坑：`ChangeBody`（表）-> `body`（下发）-> `others`（客户端算）-> `copySummonData`
+  四层，别只改一层。
+
+### 52.2 `checkMaps` 空表 -> 入口永久灰着（r53/r54）
+- 「资源勘探」= `ChapterMapMediator:338-346 openStaris`：
+  `if #self._ladderSystem:getCheckMaps() == 0 then 弹"未开放"; return end`
+- 取值链 `LadderSystem:231 -> LadderModel:136-138 return self._checkDataMaps`，
+  而 `_checkDataMaps` 只在 `LadderModel:synchronize:90-111` 填，来源是
+  **`StairsBattleData.checkMaps`**。我们一直在发 `{}` -> 入口永远锁死。
+- 形状必须严格对上（否则崩在 `cond`）：
+  ```lua
+  local cond = v.openCondition
+  if cond.currentValue == cond.targetValue then
+      local cfg = ConfigReader:getRecordById("CampaignChapter", v.id)
+      if cfg.Type == "Stairs" then data[cfg.Order] = {...} end
+  ```
+  即每项要 `{id=<CampaignChapter 的 Stairs 章 rowId>, openCondition={currentValue,targetValue}}`。
+  我们按 `CampaignChapter.tsv` 里 `Type=="Stairs"` 的 24 条（T01~T24）生成。
+
+### 52.3 【重要】Lua 的比较报错方向别搞反（r55 -> r56）
+我第一次看到 `attempt to compare string with number` 就断定"配置表 Order 是字符串"，
+把 `order` 改成字符串，结果方向反了，变成 `compare number with string`。
+- Lua 的 `__lt` 报错格式是 `"%s with %s" % (type(a), type(b))`，**a 是左值**。
+- 决定性证据不是那次报错，而是 `LadderModel:initConfigData:52-55`
+  在**初始化阶段**就做 `self._T04LastOrder < v`（v 来自 `config.Order`）。
+  游戏能正常启动 => `StairsBattle.Order` 是**数字**。
+- **教训：判断"某个配置字段是什么类型"要找一条在客户端启动路径上、
+  一定会执行到的比较，而不是靠一次线上报错的方向猜。**
+
+### 52.4 r54 的报错根本不在你以为的那一行
+`MainBattleViewSystem:88 if data.Order <= order` 两侧都是数字，不可能报类型错。
+真凶是 `:86-107`：
+```lua
+local progress = ""                       -- 字符串初值
+if data.Order <= order then progress = #stairsData          -- 数字
+else for k,v in pairs(stairsData) do
+        if order + 1 == v.Order then progress = k-1; break end -- 数字
+     end end
+     -- 循环一次没匹配上，progress 还是 ""
+...
+elseif progress < #stairsData then   -- :107  "" < 数字 -> 崩
+```
+`order=1` 时章节末层（最大 880）> 1，走 else 分支去找 `Order==2` 的行，找不到就漏成 `""`。
+**这条路径以前从没执行过** —— `checkMaps` 为空时 `:77` 就短路了。解锁入口才暴露。
+修法：`LADDER_ORDER` 从 1 抬到 9999（> 任何章节层数），第一分支恒成立。
+
+### 52.5 天梯战斗 21001 / 结算 21002（r57/r59）
+- `LadderService:2-8` 给出天梯 opcode 表：`21001` LADDER_FIGHT_STAR、
+  `21002` LADDER_FIGHT_END、`21003` 挂机英雄、`21004` 自动、`21005` 扫荡。
+- 21001 的 `data` 必须是一份完整战斗数据：
+  `LadderSystem:1096-1097` 直接 `data.campaignId or data.id` /
+  `data.gridBattleId or self:getGridBattleID(campaignId)`，
+  id 为 nil 就 `assert(battleData, "battleData:"..id)` 崩（报错就是 `battleData:nil`）。
+- 21002 请求体是空的，胜负**完全由我们回什么决定**：
+  `LadderSystem:948-989` 只看 `responseData.pass`，
+  缺字段就进 `battleFailedView`（打赢被判失败）。
+  注意 `withdraw=true` 会让 `:950` 直接 return、连结算页都不出。
+
+### 52.6 14002 请求体不是纯 JSON，且**字段顺序不固定**
+- `json.loads` 直接失败（`Invalid control character`）：引号内混着类型标记字节，
+  如 `b'"LaJ\x01"\x18y":2,...'` —— 值里带标记（闭引号在 `\x01` 之后）、
+  键名带前缀（`"\x18y"` 闭引号在 `y` 之前）。
+- 更坑的是**字段顺序会变**（Lua 表遍历序）：实测见过
+  `{"campaignId":...,"battleData":{...}}` 和 `{"battleData":{...},"campaignId":...}`。
+  所以**不能靠 `'"teams":{'` 定位** —— 那样匹配失败会静默退回默认编队，
+  玩家看到的就是"又变回两个默认的了"。改成全 body 扫"引号紧跟的 ASCII 串" +
+  `owned` 集合校验 + 键名黑名单。
+- **日志必须打完整 body**（之前只打 120 字节，`heroId` 那些字段正好被截掉）。
+- 第 2 个以后的队员是紧凑打包的，解不出来；**解出几个用几个，不足时用服务端编队补齐**，
+  绝不能让玩家只上场 1 人。
+
+### 52.7 客户端**不发** 29001
+编队界面保存走 `TeamMediator:saveEditCallBack:214-221` ->
+`TeamsService:requestSetTeams` -> `newRequest(29001, params)`，
+但**多关卡日志里 21002/14003 都出现了，29001 一次都没有**。
+玩家选的队只出现在 **14002 请求体**里。所以编队持久化的正确做法是
+**从 14002 请求解出来后写回 `team_state.json`**，别指望 29001。
+
+### 52.8 「岩-233」是星球名不是关卡号
+`Text.tsv` 的 `ChapName_*`：C00/C01/C10 = 星球：岩-233，C02 = 炽-237，
+C03/C06/C13/C14 = 蚀-286 ...。编队人数上限按星球查表，不硬编码关卡号。
+
+---
+
+## 53. 同步到内置 Lua + 构建 RL（release）版（15:24 ~ 15:45）
+
+### 53.1 两棵目录树分工不同（别搞混）
+- `E:\Test\Temp\yqlr\_out_rrcp`  = **Python mock 服务端**（rrcp_server.py 等）
+- `D:\Temp\yqlr\_out_repack`      = **打包树**（build_patched_luac.py / lua/ / *.ps1）
+- `build_lua_table.py` 里 `sys.path.insert(0, r'E:\Test\Temp\yqlr\_out_rrcp')`
+  再 `import rrcp_server` —— 跨树引用是**设计如此**，不是笔误。
+- 完整反编译在 E 盘；`D:\Temp\yqlr\_out_decompile` 只有被补丁过的那十几个文件。
+
+### 53.2 同步三步
+```powershell
+cd D:\Temp\yqlr\_out_repack
+python build_lua_table.py     # 物化 opcode 应答表 -> lua/opcode_table.lua
+# 改了 offline_server.lua 的话再跑一次回归：
+python test_rsp_offline.py
+```
+- `opcode_table.lua` 从 72.7 KB 涨到 **160.0 KB**（10001 从 65104 涨到 66465 B：
+  ExploreData / EquipData / PrismCoreData / checkMaps 都是这轮加的）。
+- opcode 从 13 个涨到 **18 个**：新增 `21001` / `21002` / `21005` / `29001`。
+  这几个在 Python 侧是 `build_response` 里分支算的、不在 `opcodes_table.json`，
+  所以要在 `build_lua_table.py` 里**单独物化**（见该文件 180-235 行）。
+
+### 53.3 emit_lua 是白名单式输出 —— 加字段必须同步改它
+`payload` 字典加了 `ladderPlaceholder` 之类，`emit_lua()` 不会自动输出，
+必须显式 `lines.append(...)`。踩过：占位符没进 Lua 表，替换静默不生效。
+
+### 53.4 21001/21005 在 Lua 侧要做占位符替换
+构建期物化的是**一份模板**战斗（T24S40），关卡号是占位符：
+
+```python
+LADDER_PLACEHOLDER = '__YQLR_LADDER_ID__'
+LADDER_GRID_PH      = '__YQLR_LADDER_GRID__'
+```
+Lua 侧按请求体里的 `T%d%d[SMX]%d%d` 抠出真实 id 再 gsub，
+`gridBattleId` 要拼成 `TOWER_<rowId>`（实测 T24S40 -> TOWER_T24S40）。
+**和 10001 的 guideData / 主屏助理是同一套占位符机制**（MEMORY 46.2：
+应答体是构建期预编码字符串，Lua 侧不能 decode->encode，cjson 会把 `[]` 变成 `{}`）。
+
+### 53.5 release profile 原本**根本不注入**内置服务端
+`build_patched_luac.py` 里是 `if IS_DEV and os.environ.get('YQLR_OSRV','1')=='1':`，
+注释写着 "dev profile only for now; enable on release once RSA + responses land"。
+现在应答层补齐并过了 `test_rsp_offline.py`，已改成只看 `YQLR_OSRV`，
+两个 profile 都能内嵌。
+
+### 53.6 RL 版构建命令
+```powershell
+$env:YQLR_PROFILE = 'release'      # 或 dev
+$env:YQLR_OSRV    = '1'
+cd D:\Temp\yqlr\_out_repack
+python build_patched_luac.py       # -> replacements_v5.json / patch_manifest.json
+python rebuild_v5.py               # -> yqlr_v5_offline.apk
+& 'E:\lib\android-sdk\build-tools\35.0.0\zipalign.exe' -p -f 4 yqlr_v5_offline.apk yqlr_v5-offline-unsigned.apk
+& 'E:\lib\android-sdk\build-tools\35.0.0\apksigner.bat' sign `
+    --ks 'C:\Users\Administrator\.android\debug.keystore' `
+    --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android `
+    --out signed_v5\yqlr_v5-offline-signed.apk yqlr_v5-offline-unsigned.apk
+```
+产物：`signed_v5\yqlr_v5-offline-signed.apk`（1720978015 B）。
+`rebuild_v5.py` 的后缀映射是 `{"dev":"dev","release":"offline"}`，
+但文件名用**下划线**（`yqlr_v5_offline.apk`），签名产物用**连字符**，别找错。
+
+### 53.7 【坑】不能用字符串搜索校验 APK 里有没有注入
+`replacements_v5.json` 里存的是 **XXTEA 加密后**的字节
+（`build_patched_luac.py:2989 ct = A.encrypt_blob(bc, b7, b8, tbl=TBL)`），
+所以 `b'OfflineServer' in data` **永远是 False**，会误判成"没注入"。
+- 要按内容校验，先走 `A.decrypt_blob(raw, tbl=TBL)`。
+- 或者直接编译 `_patched_src\yq__base__Service.luac.lua` 再搜（未加密）。
+- 字节码大小也别当判据：注入后 176 KB = 40 KB 代码 + 136 KB 应答表，数值对得上，
+  但和原包条目大小接近，容易看成"没变"。
+- 构建管线自带 `往返 PASS` 和 `magic=1b 4c 4a 02` 校验，优先信这两个。
+
+---
+
+## 54. 2026-10-10 把内置 Lua 服务端补到与 Python 全同步
+
+起因：审计发现两边 opcode 数量几乎一样（20 vs 19），但**行为差得很远**。
+
+### 54.1 【方法论】判断两个服务端是否同步，要对拍，不能数 opcode
+早期两边都是 19 个 opcode，看着"全同步"，实际上：
+- Lua 的 `14002` 只有一份 C00S01 的应答 → 第二关起敌人/站位全是第一关的
+- Lua 的 `14003` 是静态应答、无 `d.player` → 主线进度永远不推进
+- Lua 的 `21001/21005` 是一份 T24S40 模板 → 每关敌人都是那五个
+
+根因：`opcodes` 里那份 14002 是构建期跑 Python 逻辑跑出来的**某一个** stage，
+不是"按请求参数生成"。
+→ 新增 `D:\Temp\yqlr\_out_repack\test_lua_parity.py`：同一批请求同时喂给两边逐字段比。
+现况 **52 项全部一致**。
+
+### 54.2 【方案】按关卡预编码整份应答，而不是占位符
+占位符只能换字符串字段，换不了整个 `data`（敌人/站位/技能逐关不同）。
+实测 203 关主线 + 1686 关天梯合计 4.71 MB，生成耗时约 195 s。
+相对 1.7 GB 的 APK 完全可忽略，所以直接全量物化：
+
+| 表 | 条数 | 键 | 用途 |
+|---|---|---|---|
+| `battles` | 1889 | 关卡号 | 14002 / 21001 / 21005 的整份应答 |
+| `campaignProgress` | 205 | 关卡号 | 14003 的整份应答 |
+| `gacha` | 194 | `gachaId` 或 `gachaId\|10` | 15001 单抽 / 十连 |
+| `heroTpl` | 300 | `<cid>#<槽位>` | 我方英雄片段（x/y/attrs 是占位符） |
+| `spots` / `attrs` / `tcb` / `terrain` | 各 1888~1889 | 关卡号 | 站位 / 属性 / 友军战功和 / 地形格 |
+
+`opcode_table.lua` 从 160 KB 涨到约 7.3 MB。
+
+### 54.3 【关键】编队能替换的前提：实测同关换队只差 x/y/uid
+`build_lua_table.py` 里用改写 `player_team_hero_ids` 的方式，
+让**真的** `gen_battle_data` 出战指定 5 人，从而拿到正确的英雄对象 ——
+而不是自己拼 `_hero_base()`（那样会把 `apply_hero_config` 的字段规则抄第二份，
+将来 Python 加字段就分叉）。
+实测结论：同关换编队后敌方、totalCombat、以及每个英雄除 x/y/uid 外的全部字段都不变，
+`level/star` 也是全局的。只有 `attrs`（`GridBattle.AttrCoef`）逐关不同，
+所以它按关卡单独物化。
+
+### 54.4 【坑】构建期必须隔离状态文件
+`build_lua_table.py` 里要把这两个路径指到**不存在的文件**：
+```python
+Server.TEAM_STATE_PATH     = <tmp>/no_team.json
+Server.CAMPAIGN_STATE_PATH = <tmp>/no_campaign.json
+```
+不隔离的话会读到你上次在真机上编的队 / 打的关，然后固化进表：
+- 站位错 → 离线端我方站位和 Python 端对不上
+- 进度错 → 刚开局 `branchLastPassed` 就已经是 `C01S09` 了
+
+### 54.5 【坑】天梯关卡 id 有两种形态
+`StairsBattle.tsv` 里既有 `T07S13` 也有 `T_FIRE_S001` / `T_LIGHT_S001`。
+Python 的 `STAIRS_ID_RE = T\d{2}[SMX]\d{2}` 只认前一种，
+导致这几百关在 21001/21005 上完全打不了 —— **这是线上服务端的真 bug**，
+不是只有离线端有问题。已改为 `extract_stairs()`：正则捞候选 + 拿 rowId 集合校验。
+Lua 侧改成 `find_keyed()`：直接按表反查，对任意 id 形态都成立。
+教训：**别用固定正则解析 id，用表反查。**
+
+### 54.6 【坑】C00S01 是有意不走动态生成的
+`rrcp_server.py` 的 14002 分支写死了 `camp != 'C00S01'`，
+因为那份手写静态响应是唯一在真机从头验通过的
+（英雄固定 (2,3)，正好避开该关 `landformSP` 的 1_2 / 2_2 两格，见 `:3166`）。
+离线端要跟 Python 一致，就原样照抄 `table['14002']`。
+
+### 54.7 【坑】Lua 侧也要校验地形
+玩家在编队界面能摆哪就摆哪，不保证不压地形。
+Python 会校验后回退到默认站位，Lua 必须一样 ——
+压在 `MapDataId.landformSP` 上时，那个地形技能会拿到 nil 的 target 直接崩
+（`SpecialTerrain_XinShouHuiNeng0_4_2.lua:174/176`）。
+做法：物化每关的 `terrain` 表，Lua 里玩家给的坐标命中就退回 `spots`。
+
+### 54.8 【坑】编队不足要补齐到 cap
+请求里第 2 个以后的队员是紧凑打包的（实测第二成员键是 `"La6\x3f..."` 不是英雄 id），
+常常只能解出 1 个。绝不能因此只派一个人上场 —— 用户实测就是"只会上一个角色"。
+补位规则照抄 `rrcp_server.gen_battle_data:3254-3281`：
+先用"已拥有里非默认"的英雄补，一个都没有才退回服务端编队；
+不能拿默认那对来凑（玩家看到的就是"一个默认一个我选的"）。
+
+### 54.9 【坑】emit 出的 Lua 注释必须纯 ASCII
+`opcode_table.lua` 按 ascii 编码写出，注释里出现中文会
+`UnicodeEncodeError: 'ascii' codec can't encode character`，
+而且位置会报在 16 万字节处（中间某个 battles 条目），很难联想到是注释的问题。
+
+### 54.10 【坑】对拍时 Python 侧的返回值是**活引用**
+14003 的 `resp['d']['player']` 就是服务端 table 里那个 dict，
+之后每次 14003 都会原地改它。直接留引用的话前面取到的"快照"
+会被后面的调用改掉，比对结果莫名其妙地漂。
+必须 `json.loads(json.dumps(x))` 断开引用。
+另外 14003 是有状态的（`campaign_passed` 一直累积），
+每个子用例都要用**全新的** Server 实例，且状态文件要重定向到不存在的位置。
+
+### 54.11 剩下 4 项有意保留的差异
+| 项 | 原因 |
+|---|---|
+| `10032` | Lua 改开关要重跑 `apply_*()` 读 TSV，做不到。如实返回 `resCode=1` + 说明 |
+| `15001` 出货英雄 | 构建期冻住结果，Python 每次重摇。离线端固定结果反而合脚 |
+| `14003` 的 `branchLastPassed` | 离线端按"一路打上来"穷举，可能比 Python 当次会话更靠后（含 `CxxExx` 剧情关）。对拍时按 `campaign_order_rank` 判定"Lua 更靠后"就不算错 |
+| `C00S01` | 见 54.6 |
+
+### 54.12 构建说明文档
+`D:\Temp\yqlr\LUA_BUILD.md` —— 链路、预编码约束、表结构、构建命令、
+改了 Python 之后要不要重跑、排查手册。
+
+---
+
+## 55. 中文语音 / 设置页 / 关卡解锁 / 注入器（2026-10-10 19:00 ~ 21:30）
+
+### 55.1 中文语音为什么当年做不成，现在做成了
+第 33.1 节的结论「中文配音在离线环境下不可能实现（除非把 470 个文件
+也打进包，**而我们手上没有它们**）」，前提在这一轮变了：拿到了素材
+`D:\System\下载\跃迁旅人-中文配音-原始素材.zip`。
+
+校验（`inject_voice_cn.py`）：**240/240 文件名 + size + MD5 全对**，
+且 120 个包全部被 `Audio.tsv` 的 `PkgName` 引用（未引用 0 个），
+所以 417 MB 全是真需要的，没有死重量。
+文件头 `AFS2` = Wwise SoundBank。
+
+### 55.2 【坑】APK 超过 2^31 时 zipalign / apksigner 双双失败
+全量注入语音后 APK = 2,151,504,903 B，`2^31 = 2,147,483,648`，
+**超 4,021,255 B（3.83 MB）**：
+
+- `zipalign` → `Unable to open ... as zip archive`
+- `apksigner` → `exit=1`，输出文件不完整
+
+根因不是文件大小本身，是**中央目录偏移 2,161,709,620 越过 2^31**，
+按 32 位**有符号**解释就变负。
+腾空间的手段全部试过且都不够：
+- DEFLATE level 9 比 level 6 只多省 0.1 MB（Wwise bank 压不动，92.6%~99.6%）
+- `assets.db`（我们自己替换的条目）已经是 DEFLATED，没得压
+- `.png@alpha`(142MB) / `.moc3` / `.usm` / `.td` / `.fui` 压缩率 100.0%
+- 唯一有肉的是既有 `.awb`（554 MB → 97.3%，省约 15 MB），
+  但那会动到**当前正常的 JP 配音和 BGM**，不划算
+
+> 抽样外推会严重失真：只取最大的 12 个文件估「省 49 MB」，
+> 实际 level 6 只省了 11.7 MB —— 大文件恰恰最难压。
+
+### 55.3 【坑】游戏只从 `<writablePath>/<real>` 读可写资源
+实测三种位置：
+
+| 位置 | 结果 |
+|---|---|
+| `/data/data/<pkg>/files/release/<md5路径>` | ✅ 能出声 |
+| `/sdcard/Android/data/<pkg>/files/release/...` | ❌ |
+| `/storage/emulated/0/yqlr/...`（公共目录） | ❌ |
+
+**不是权限问题**（`targetSdk=26` 走 legacy 外部存储、
+`READ_EXTERNAL_STORAGE` 已授权）。
+游戏有自己的 FileUtils delegate，只认这一个可写位置；
+在 `dmAudio` 里加 `addSearchPath` 和绝对路径都插不进去。
+判据：设备上那个**空的** `files/release/` 目录，名字正好等于
+`assets.db` 里 `real` 字段的格式 `release/<md5[0:2]>/<md5[2:4]>/<md5[4:]>`。
+
+### 55.4 【坑】apktool 不能用来编 manifest
+`apktool d` 能把 manifest 解成文本（去掉 `-r`，加了它会保留二进制），
+但 `apktool b` **必须经过 aapt2 link**，而本游戏 manifest 里有
+`android:theme="@2131689726"`（0x7f…，指向自身资源表），
+空 `resources.arsc` 过不了类型校验：
+
+```
+error: '@2131689726' is incompatible with attribute theme (attr) reference
+```
+
+apktool 没有独立的 AXML 编码器可用。而游戏资源是内容寻址放在 `assets/`
+下的（不是标准 `res/` 树），apktool 也认不出来。
+→ 只能自己写 AXML 定点修改器（`axml_patch.py` + `inject_documents_provider.py`）。
+
+### 55.5 AXML 定点改 manifest 的四个坑（都踩了）
+1. **元素 chunk 是平铺的兄弟节点**，`START` 的 size **只含它自己和属性**，
+   不含子节点（实测 `manifest`=196、`<application>`=256，都远小于其子树）。
+   **只有根 chunk 的 size 等于文件全长**。一开始去改 `<application>` 的 size，是错的。
+2. **`ResXMLTree_node` 里 `prefix` 在 +16、`uri` 在 +20**，拿错整个命名空间就废
+   （渲染出 `<android:provider>` 而不是 `<provider>`）。
+3. **属性名必须在 RES_MAP 里有 res id**，否则 PackageParser 静默丢弃。
+   本 manifest 的 RES_MAP 只有 41 项，`permission` 不在里面，
+   得把 RES_MAP 扩到 150 项（补 109 个 0 占位）并填 `0x01010006`。
+4. **AXML 里属性存的是本地名**（`name`），`android:` 前缀走 namespace；
+   搜 `android:name` 会误判成"缺"。
+
+另外：**元素 chunk 的 ns 必须是 -1**，只有属性用 android 的 uri，
+否则元素名会被渲染成 `ns0:provider`。
+
+### 55.6 【坑】漏写回条目，zipalign 静默通过、apksigner 才报错
+重打包时写了
+```python
+if i.filename in ('AndroidManifest.xml', dexname): continue
+```
+结果新 manifest **从没被写回去**，包里直接少了这个条目。
+`zipalign` 照样 `rc=0`（它不检查条目完整性），
+最后是 `apksigner` 报 `Missing AndroidManifest.xml`。
+
+→ **打包后必须逐条点名关键条目 + 比对 manifest 长度**，
+不能指望任何工具替你发现。
+
+### 55.7 校验步骤抓到的 bug（值不值钱看这个）
+`pyaxmlparser` 把新旧 manifest 都解析成树、去掉新增 provider 后
+**逐字符比对**，靠它抓出了 55.5 的第 2 条。
+最终结果：`除新增 <provider> 外，其余内容逐字符一致`（8333 = 8333 字符）。
+
+### 55.8 注入文件提供器（DocumentsProvider）
+开源实现：`github.com/AbdurazaaqMohammed/InjectDocumentsProvider`
+（原作者注明思路来自 MT 管理器作者 Lin Jin Bin）。
+`a.dex` 9,380 B → 加为 `classes3.dex`；manifest 加 `<provider>`。
+
+装完实测生效：
+```
+Provider{39dfc9c com.biubiux2.theleaper.aligames/bin.mt.file.content.MTDataFilesProvider}
+content query --uri content://<pkg>.MTDataFilesProvider/root
+  → Row: 0 root_id=<pkg>, title=跃迁旅人
+```
+用途：**无 root** 也能把语音放进 app 私有目录。
+注意 `content query` 只能查 `/root`，深层遍历要走真实 SAF 客户端
+（DocumentsUI），CLI 构造不出那种 URI。
+
+### 55.9 【坑】Lua 不支持 `\uXXXX` 转义
+在 Lua 源码里写 `'\u4e2d\u6587'` 会
+`invalid escape sequence near '...'`。
+Lua 只有 `\ddd` 十进制转义，中文要**直接写**（文件本身是 UTF-8，没问题）。
+
+### 55.10 【坑】`GameConfigs.DebugCfgValues` 是惰性初始化的
+设置页崩：
+```
+SiteGamePageWidget.luac:400: attempt to index field 'DebugCfgValues' (a nil value)
+```
+我们插进设置页的 bool 开关，`initFunc` 直接索引
+`GameConfigs.DebugCfgValues[...]`，但那张表是
+`_YQLR_CFG_VALUES()` 里 `or {默认值}` **惰性**建的，
+玩家刚进页面还没点过任何开关 → nil。
+→ `initFunc` 必须走 `_YQLR_CFG_VALUES()["name"]`。
+（int 档位那类读的是独立的 `_YQLR_CFG_INDEX`，自带默认值，所以没事。）
+
+### 55.11 【重大】14003 请求体里**没有 campaignId**
+实测只有 **15 B**（第 52 节 3017 行早就记了，一直没被重视）。
+
+Python 侧靠记忆兜底：
+```python
+camp = self.extract_campaign(body) or self.last_campaign
+```
+离线端早期只 `find_keyed(body, campaignProgress)` → 15 B 里根本没有关卡号
+→ 查表落空 → 走静态兜底 → `lastPassed` 不推进
+→ **「关卡打过了但下一关不解锁」**。
+
+修：14002/21001/21005 命中时写 `_state.last_stage`，
+14003 查表落空时用它兜底。
+
+> **为什么对拍测试没抓到**：我在合成的 14003 请求体里**塞了** campaignId，
+> 而真客户端不发。**测试用例本身掩盖了 bug**。
+> 已补回归用例：先发 14002，再发**空 body** 的 14003。
+> → 对拍数据要照抄真机抓包的字节，不能自己想当然。
+
+### 55.12 【坑】`adb reverse` 会占住设备 8888，RL 包必须清
+RL 的服务端在**应用内**监听 127.0.0.1:8888，
+而 `adb reverse tcp:8888 tcp:8888` 会在**设备端**占住同一个端口
+→ `bind` 直接失败。
+第 50.8 节那套流程是给 **dev 包**（Python mock 跑在宿主）用的，RL 包必须跳过。
+设备上 11:06/11:15/11:18 那三条历史 `bind 失败` 记录就是这个原因。
+
+### 55.13 【坑】`$env:` 不跨工具调用传递
+在一条命令里设了 `$env:YQLR_PROFILE='release'`，下一条命令跑
+`rebuild_v5.py` 时读不到，退回默认 `dev`，产物写进了 `yqlr_v5_dev.apk`，
+而我却拿 15:42 的旧包去对齐签名 —— 装上去后 19 个替换条目里**缺 11 个**。
+
+→ `build_patched_luac.py` / `rebuild_v5.py` / zipalign / apksigner
+**必须在同一条命令里跑**，或者干脆用 `deploy_dev.ps1`。
+
+### 55.14 【坑】`install -r` 之后必须重推 `files/assets.db`
+第 50.8 节的老坑，本轮又踩了一次。顺序固定：
+```
+build -> rebuild -> zipalign -> apksigner -> install
+-> adb root -> patch_runtime_db.py -> adb unroot
+-> adb reverse（仅 dev 包）-> 启动
+```
+
+### 55.15 挂起中
+- **资源勘探从负数层级开始**：`apply_explore_config`（rrcp_server.py:1146）
+  下发的 `chainMap` / `finishChainMap` / `finishObjects` / `checkMap`
+  **全是空表**，而 `Explore.tsv` 里明明有 `TaskChainId` / `TaskId` / `MapID`。
+  查过 `ExploreModel:synchronize`（70 行全文）确认它只做 `valueReplace`
+  合并、**不计算层级**，所以层级是视图层推出来的，
+  确切定义**还没定位到** → 不凭猜测填字段（填错会让
+  `ExploreSystem:264` 的 `arrChainMap[data.Id]` 取到 nil 然后崩）。
+  等 Python 侧修好后，`ExploreData` 在 10001 里，
+  **重跑 `build_lua_table.py` 会自动带上**，不需要动 Lua。
+- **关卡进度冷启动丢失**：方案见 `D:\Temp\yqlr\CAMPAIGN_PERSIST_PLAN.md`。
+  注意这条**不会**因为 Python 修好而自动生效 —— 离线端是静态快照，没有状态机。
+  → **已于 2026-10-10 22:20 实施并装包**，细节见第 56 节。
+
+---
+
+## 56. 关卡进度持久化（2026-10-10 21:45 ~ 22:20）
+
+按 `D:\Temp\yqlr\CAMPAIGN_PERSIST_PLAN.md` 实施。方案全文在那个文档里，
+这里只记**实施时踩到、和方案本身不一致**的东西。
+
+### 56.1 【坑】一个变量不能承担两个角色
+初版方案让 `_state.last_stage` 同时表示「本次 14002 打的关」和
+「已通关的最远那关」。真实链路立刻坏：
+
+```
+14002(C01S02) -> last_stage = C01S02
+14003(空body) -> cid = last_stage = C01S02
+              -> campaign_farther(C01S02, C01S02)  <- 自己跟自己比
+              -> 永远不落盘
+```
+
+**已拆成 `last_stage`（内存态，14003 兜底用）和
+`saved_stage`（落盘态，10001 用）**，比较用 `campaign_farther(cid, saved_stage)`。
+→ 凡是「临时上下文」和「持久状态」沾边的，都要拆成两个变量。
+
+### 56.2 【坑·会发坏包】占位符必须有兜底，哨兵绝不能到客户端
+哨兵 `__YQLR_CD__` 是**字符串**，而 `CampaignData` 必须是**对象**。
+初版方案的替换条件是 `if ... and _state.last_stage then`，
+于是**冷启动且无落盘时替换被整个跳过**，哨兵原样发给客户端：
+
+```json
+"CampaignData":"__YQLR_CD__"    <- string 而不是 table，一装新包就进不了主线
+```
+
+→ 构建期额外产出 `campaignCDDefault`（`Campaign.tsv` 第一行 `C00S01`），
+运行时 `stage = saved_stage or campaign_cd_default`，
+再兜一层 `"CampaignData":{}`。**任何路径都不让哨兵流到客户端。**
+
+→ 凡是往预编码应答里埋占位符，都要问一句：
+**"这个占位符没被替换时会怎样？"** 只在"有落盘时才替换"是不够的。
+
+### 56.3 【坑】`campaign_order_rank` 有大量并列，不能当排序键
+实测 **205 关只有 178 个不同的 rank** —— `C00S01` 和 `C00M01`
+这类剧情关共用同一个 rank。用 `n > o` 比会**打平**，
+于是「打完 C00M01 再打 C00S01」这种正常推进不更新落盘值，
+冷启动反而拿 C00M01 的快照。
+
+→ 改用 **`Campaign.tsv` 行序**（1..205，205 关全不并列）。
+它同时也是 `campaignProgress` 快照的累加顺序
+（`gen_campaign_progress` 按它逐行 `campaign_passed.add`），
+所以「行序更大」==「快照包含更多关卡」，语义天然对齐。
+
+→ **选排序键前先看并列情况**：`len(set(values))` 对比 `len(values)`。
+
+### 56.4 【坑】深拷贝 `datas`，否则 205 条进度应答全被污染
+`build_lua_table.py` 里 `resp['data']['player']` 和
+`table['10001']['data']['player']` **是同一个对象**（原 194-196 行就警告过）。
+写标量（`guideData` / `mainScreenHeroId`）无所谓，写完立刻 `json.dumps`。
+但 `CampaignData` 会被后面的 `gen_campaign_progress()` 通过 `s2.table`
+读到并 `cd.update(...)`。
+
+直接写 `p['datas']['CampaignData'] = 哨兵` 会让
+**205 条预编码进度应答里的 CampaignData 全变成那个字符串**。
+
+→ 换哨兵前 `copy.deepcopy(datas)` 再赋回去。
+
+### 56.5 【坑】别拿正则在生成好的 Lua 表上数条目
+自检用 `\n        \["..."\] = ` 数 `campaignProgress`，205 条只数出 **204** ——
+外层正则把第一条前的 `\n` 吃掉了，第一条匹配不上。
+一度以为生成少了 1 条。
+
+→ 按行 `splitlines()` 再逐行匹配，别在换行处省字符。
+
+### 56.6 产物与规模
+```
+campaignCD        205 条   76 KB   （CampaignData 子对象，与 progress 逐字节一致）
+campaignOrder     205 条   1..205
+campaignCDDefault          C00S01
+opcode_table.lua  7427.3 KB（原 7327.1 KB，+100 KB）
+APK 条目 20333   rebuild_v5.py 总体: PASS
+签名后 1,727,294,147 B
+```
+
+### 56.7 设备实测（冷启动、无落盘）
+```
+22:20:35 campaign state: 无落盘，10001 用初值快照
+22:20:35 campaign state: saved=nil default=C00S01 cd=205 order=205
+22:20:41 10001 CampaignData 用 C00S01 替换（初值快照）
+22:20:41 -> RESP #1 opcode=10001 body=68410 B
+```
+
+### 56.8 打包环境备忘（本轮重新踩）
+- build-tools 不在 `%LOCALAPPDATA%\Android\Sdk`，在
+  **`E:\lib\android-sdk\build-tools\35.0.0`**
+- keystore 不在 `_out_repack`，在
+  **`C:\Users\Administrator\.android\debug.keystore`**
+- 这两个路径在 `inject_documents_provider.py` 里能看到（`KS = ...`）
+
+→ 顺手把 `Remove-Item $aligned $signed` 写在找 build-tools **之前**，
+把上一个签名包删了才发现路径不对。**先确认路径，再删旧产物。**
+
+### 56.9 provider 注入叠加到持久化版本上（22:28）
+`inject_documents_provider.py` 默认吃的是**未签名**的 `yqlr_v5_offline.apk`，
+所以在跑完持久化构建后直接重跑即可，不用改脚本：
+
+```
+manifest      16944 -> 18088 B (+1144)
+校验           除新增 <provider> 外，其余内容逐字符一致 (8333 = 8333)
+新增            classes3.dex (9380 B)   已有 classes.dex / classes2.dex
+zipalign rc=0   apksigner rc=0   verify rc=0
+产出            yqlr_v5_offline_provider-signed.apk (1647.29 MB)
+```
+
+注意：provider 注入**不经过** `build_patched_luac.py`，
+所以顺序永远是「先构建 → 再注入」，反过来会把上一轮的 Lua 白注入掉。
+`rebuild_v5.py` 不会自动注入 provider。
+
+设备实测：
+```
+Provider Resolver Table:
+  android.content.action.DOCUMENTS_PROVIDER:
+  5f72eae com.biubiux2.../bin.mt.file.content.MTDataFilesProvider
+```
+
+`content query --uri content://...MTDataFilesProvider/root` 报
+```
+SecurityException: requires that you obtain access using ACTION_OPEN_DOCUMENT
+```
+**这是正确行为**，不是故障 —— manifest 里加了
+`android:permission="android.permission.MANAGE_DOCUMENTS"`，
+必须走真实 SAF 客户端（DocumentsUI）。见 55.8。
+
+### 56.10 关卡进度持久化 + provider 在设备上的联合验证
+```
+/sdcard/campaign_state.json          {"stage":"C00S04"}      22:23 写入
+22:29:17 campaign state loaded: C00S04
+22:29:17 campaign state: saved=C00S04 default=C00S01 cd=205 order=205
+22:29:22 10001 CampaignData 用 C00S04 替换（落盘进度）
+```
+
+即：`install -r` 重装（换成 provider 版）之后进度**没丢**，
+10001 下发的是 C00S04 的快照而不是构建期初值 —— 持久化链路闭环。
+
+
+
+

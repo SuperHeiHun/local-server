@@ -58,6 +58,32 @@ local _state = {
     log = {},
     spki = nil,
     nframe = 0,
+    -- 主屏助理（opcode 10038 changeHero）。离线侧和 Python 侧共用同一个
+    -- main_screen_state.json，这样两种服务端之间切换不会丢选择。
+    main_hero = nil,
+    main_type = nil,
+    main_hero_ph = nil,
+    main_type_ph = nil,
+    main_default = nil,
+    debug_toggles = nil,
+    -- 关卡进度。离线端本来是纯回放器（campaignProgress 是构建期穷举的静态
+    -- 快照），进度只活在这几个变量里，冷启动就回到构建时的初值。
+    --
+    -- last_stage 和 saved_stage **必须分开**，早先合并成一个导致两个 bug：
+    --   1) 14002 先把 last_stage 设成本次打的关，14003 再比
+    --      campaign_farther(cid, last_stage) 就成了自己跟自己比 -> 永远不落盘；
+    --   2) 冷启动还没打过任何关时 last_stage 是 nil，10001 会把构建期的
+    --      哨兵 "__YQLR_CD__" 原样发给客户端 —— 那是个**字符串**，
+    --      而 CampaignData 必须是对象，客户端拿到就炸。
+    -- last_stage = 本次 14002 打的关（内存态，14003 兜底要用）
+    -- saved_stage = 已通关的最远那关（落盘态，10001 要用）
+    -- campaign_cd = 每关的 CampaignData 片段，供 10001 替换哨兵
+    last_stage = nil,
+    saved_stage = nil,
+    campaign_cd = nil,
+    campaign_cd_ph = nil,
+    campaign_cd_default = nil,
+    campaign_order = nil,
 }
 
 local function slog(fmt, ...)
@@ -813,6 +839,528 @@ if not OPCODE_TABLE then
     end
 end
 
+-- 主屏助理落盘。与 Python 侧共用同一个 main_screen_state.json。
+local MAIN_SCREEN_PATH = '/sdcard/main_screen_state.json'
+
+local function load_main_screen()
+    local f = io.open(MAIN_SCREEN_PATH, 'r')
+
+    if not f then
+        local d = _state.main_default or {}
+        _state.main_hero = d.heroId
+        _state.main_type = d.type
+        return
+    end
+
+    local raw = f:read('*a')
+    f:close()
+
+    -- 不引 JSON 库（宿主 luajit 没有，设备上的 cjson 也不能在离线自测里用），
+    -- 只按字节抽这两个标量字段，理由和 Python 侧的 change_hero_params 一样。
+    --
+    -- 必须用 string.match 而不是 string.find：find 返回的是**整个匹配**的
+    -- 起止位置，用 string.sub(a+1, b) 会把 `"heroId":` 也截进去
+    -- （曾经抽出过 'heroId":"BaiJ' 这种脏值）。match 才返回捕获组本身。
+    local function grab(key)
+        return string.match(raw, '"' .. key .. '"%s*:%s*"([^"]*)"')
+    end
+
+    _state.main_hero = grab('heroId') or (_state.main_default or {}).heroId
+    _state.main_type = grab('type') or (_state.main_default or {}).type
+    slog('main screen hero loaded: %s / %s', tostring(_state.main_hero),
+         tostring(_state.main_type))
+end
+
+local function save_main_screen()
+    local f = io.open(MAIN_SCREEN_PATH, 'w')
+
+    if not f then
+        slog('!! cannot write %s', MAIN_SCREEN_PATH)
+        return false
+    end
+
+    f:write('{"heroId":"', tostring(_state.main_hero or ''), '","type":"',
+            tostring(_state.main_type or ''), '"}')
+    f:close()
+    return true
+end
+
+-- ---------------------------------------------------------------- 编队
+-- 与 Python 侧共用 team_state.json，两种服务端之间切换不会丢编队。
+-- 格式就是一串 heroId，用逗号分隔 —— 不引 JSON 库，理由同 load_main_screen。
+local TEAM_PATH = '/sdcard/team_state.json'
+
+local function load_team()
+    local f = io.open(TEAM_PATH, 'r')
+    _state.team = nil
+
+    if not f then
+        return
+    end
+
+    local raw = f:read('*a')
+    f:close()
+    -- 抠出最后一个 "team": [...] 或顶层 [...] 里的英雄名。
+    -- 简单起见按已知英雄 id 逐个匹配出现顺序。
+    local ids = {}
+    if raw then
+        for h in string.gmatch(raw, '[A-Za-z][A-Za-z0-9_]*') do
+            ids[#ids + 1] = h
+        end
+    end
+    if #ids > 0 then
+        _state.team = ids
+        slog('team loaded: %s', table.concat(ids, ','))
+    end
+end
+
+local function save_team(ids)
+    if not ids or #ids == 0 then
+        return false
+    end
+    local f = io.open(TEAM_PATH, 'w')
+    if not f then
+        slog('!! cannot write %s', TEAM_PATH)
+        return false
+    end
+    f:write('{"team":[')
+    for i, h in ipairs(ids) do
+        if i > 1 then
+            f:write(',')
+        end
+        f:write('"', h, '"')
+    end
+    f:write(']}')
+    f:close()
+    _state.team = ids
+    slog('team saved: %s', table.concat(ids, ','))
+    return true
+end
+
+-- ---------------------------------------------------------------- 关卡进度落盘
+--
+-- 为什么必须落盘：campaignProgress 是构建期按"一路打上来"穷举的静态快照，
+-- 运行时没有任何状态机。不落盘的话，打过的关卡退出重进就回到构建时的初值。
+--
+-- 为什么只存一个关卡号而不是 Python 侧那样的 campaign_passed 全集：
+-- campaignProgress[stage] 本身就是"通关 stage 之后"的**累计**快照，已经把
+-- 之前所有关卡的效果算进去了，所以记住最远的那一关就够了，全集是冗余的。
+--
+-- 格式只有 {"stage":"C02S03"} —— 不引 JSON 库，理由同 load_main_screen。
+local CAMPAIGN_PATH = '/sdcard/campaign_state.json'
+
+-- 测试钩子：离线自测跑在宿主机上，没有 /sdcard，io.open 会直接失败。
+-- 设备上用默认值，不影响运行时。理由同本文件其它 OfflineServer.* 导出。
+function OfflineServer.campaign_path(p)
+    if p then
+        CAMPAIGN_PATH = p
+    end
+    return CAMPAIGN_PATH
+end
+
+-- 落盘的关卡可能已经不在表里了（表重建过 / 版本回退 / 手改成乱码）。
+-- 这时必须丢掉回落默认值，不能带着一个查不到的 id 启动。
+local function campaign_known(stage)
+    return stage and _state.campaign_cd and _state.campaign_cd[stage] ~= nil
+end
+
+-- 这次通关是不是比落盘的更远？
+--
+-- campaign_order 是 Campaign.tsv 的**行序**（1..N），不是 campaign_order_rank()。
+-- 实测 205 关只有 178 个不同的 rank —— C00S01 和 C00M01 这类剧情关共用同一个
+-- rank，用 rank 比会打平，于是"打完 C00M01 再打 C00S01"这种正常推进不会更新
+-- 落盘值，冷启动反而拿 C00M01 的快照。
+-- 行序也正是 campaignProgress 快照的累加顺序，所以"行序更大" == "快照包含更多关卡"。
+local function campaign_farther(new_stage, old_stage)
+    local order = _state.campaign_order or {}
+    local n = order[new_stage]
+    local o = old_stage and order[old_stage] or nil
+
+    -- 行序恒 >= 0，这里的 < 0 只是防御（万一以后换排序键）。
+    if not n or n < 0 then
+        return false
+    end
+    if not o or o < 0 then
+        return true
+    end
+    return n > o
+end
+
+local function load_campaign_state()
+    _state.saved_stage = nil
+    local f = io.open(CAMPAIGN_PATH, 'r')
+
+    if not f then
+        slog('campaign state: 无落盘，10001 用初值快照')
+        return
+    end
+
+    local raw = f:read('*a')
+    f:close()
+    -- string.match 返回捕获组本身；用 find 会把 "stage": 也截进去
+    -- （load_main_screen 里踩过这个坑）。
+    local stage = raw and string.match(raw, '"stage"%s*:%s*"([^"]*)"') or nil
+
+    if stage and campaign_known(stage) then
+        _state.saved_stage = stage
+        slog('campaign state loaded: %s', stage)
+    elseif stage then
+        slog('campaign state 里 %s 已不在表里，丢弃回落初值', stage)
+    end
+end
+
+local function save_campaign_state()
+    if not campaign_known(_state.saved_stage) then
+        return false
+    end
+
+    local f = io.open(CAMPAIGN_PATH, 'w')
+
+    if not f then
+        slog('!! cannot write %s', CAMPAIGN_PATH)
+        return false
+    end
+
+    f:write('{"stage":"', _state.saved_stage, '"}')
+    f:close()
+    slog('campaign state saved: %s', _state.saved_stage)
+    return true
+end
+
+-- 从请求体里抠编队。规则逐条照抄 rrcp_server.Server.parse_battle_teams：
+--   1) 先扫带引号的 token，再扫裸 token（打包段里英雄名没有引号前缀）
+--   2) 非 owned 的一律丢掉；裸 token 逐个前缀去 owned 里匹配（MoG2 -> MoG）
+--   3) 按出现顺序去重
+--   4) body 里还有别的候选时，剔掉 apply_team_config 自动塞的默认那对
+--   5) 每个人在"自己结束位置 -> 下一个人开始位置"这一段里找 x/y
+local function scan_team(raw)
+    local owned = _state.hero_ids
+    if type(raw) ~= 'string' or type(owned) ~= 'table' or #owned == 0 then
+        return {}
+    end
+
+    local ownedset, nothero = {}, {}
+    for _, h in ipairs(owned) do
+        ownedset[h] = true
+    end
+
+    for _, h in ipairs(_state.team_not_hero or {}) do
+        nothero[h] = true
+    end
+
+    -- Lua 模式没有 {n,m} 量词，用 * / + 代替；也不能像 Python 那样
+    -- 一次 finditer 扫全文，改成 gmatch 收集 (位置, token)。
+    local cands = {}
+    local function scan(pat, quoted)
+        local pos = 1
+        while true do
+            local s, e, tok = string.find(raw, pat, pos)
+            if not s then
+                break
+            end
+            pos = e + 1
+            if not nothero[tok] then
+                if not ownedset[tok] then
+                    if quoted then
+                        -- 带引号的是结构完整的字段名，不像英雄就丢掉
+                    else
+                        -- 裸 token 逐个前缀缩
+                        local hit
+                        for n = #tok - 1, 1, -1 do
+                            if ownedset[string.sub(tok, 1, n)] then
+                                hit = string.sub(tok, 1, n)
+                                break
+                            end
+                        end
+                        if hit then
+                            cands[#cands + 1] = { s = s, e = e, t = hit }
+                        end
+                    end
+                else
+                    cands[#cands + 1] = { s = s, e = e, t = tok }
+                end
+            end
+        end
+    end
+
+    scan('"([A-Za-z][A-Za-z0-9_]*)', true)
+    scan('([A-Z][A-Za-z0-9_]+)', false)
+
+    table.sort(cands, function (a, b)
+        return a.s < b.s
+    end)
+
+    local hits, seen = {}, {}
+    for _, c in ipairs(cands) do
+        if not seen[c.t] then
+            seen[c.t] = true
+            hits[#hits + 1] = c
+        end
+    end
+
+    -- 剔掉自动补的默认英雄（只在还有别的候选时剔）
+    local def = {}
+    for _, h in ipairs(_state.default_hero_ids or {}) do
+        def[h] = true
+    end
+    local picked, non_def = {}, {}
+    for _, h in ipairs(hits) do
+        picked[#picked + 1] = h.t
+        if not def[h.t] then
+            non_def[#non_def + 1] = h.t
+        end
+    end
+
+    local use, use_set = picked, {}
+    if #non_def > 0 and #non_def < #picked then
+        use = non_def
+    end
+    for _, h in ipairs(use) do
+        use_set[h] = true
+    end
+
+    local slots = {}
+    local cap = _state.team_cap or 5
+    for i, c in ipairs(hits) do
+        if not use_set[c.t] then
+            -- 跳过
+        else
+            -- 段：从这个人名的结束位置，到下一个人名的开始位置
+            local nxt = #raw + 1
+            for j = i + 1, #hits do
+                if hits[j].s > c.e then
+                    nxt = hits[j].s
+                    break
+                end
+            end
+            local seg = string.sub(raw, c.e + 1, nxt - 1)
+            -- Lua 模式没有先行断言，改成吃掉前一个非字母数字字符再捕获。
+            local _, xs = string.match(seg, '([^%w_])x[^%w]*(%d+)')
+            local _, ys = string.match(seg, '([^%w_])y[^%w]*(%d+)')
+            slots[#slots + 1] = {
+                heroId = c.t,
+                x = tonumber(xs),
+                y = tonumber(ys),
+            }
+            if #slots >= cap then
+                break
+            end
+        end
+    end
+    return slots
+end
+
+-- 在请求体里找一个"表里确实存在"的键，返回 键, 值。
+--
+-- 不写死 T%d%d[SMX]%d%d 这种正则：StairsBattle.tsv 的 id 有两种形态
+-- （T07S13 和 T_FIRE_S001），正则一漏就静默退回静态兜底，表现成
+-- "天梯某一类关卡永远是第一关的敌人"。按表反查对任意 id 形态都成立。
+local function find_keyed(raw, tbl, cap)
+    if type(raw) ~= 'string' or type(tbl) ~= 'table' then
+        return nil
+    end
+    cap = cap or 400
+    local n = 0
+    for tok in string.gmatch(raw, '[A-Za-z_][A-Za-z0-9_]*') do
+        n = n + 1
+        if n > cap then
+            break
+        end
+        local v = tbl[tok]
+        if v then
+            return tok, v
+        end
+    end
+    return nil
+end
+
+-- 【坏字节导致的"半个名字"】
+--
+-- 实测 15001 的请求体长这样（真机日志）：
+--     {"isTen":true,"gachaId":"G
+-- `_DoubleUp_ZhangY_BaiJ_1"}
+-- 真正的池名是 Gacha_DoubleUp_ZhangY_BaiJ_1，但中间的 "acha" 被替换成了
+-- 0x0A + 一个反引号。于是正则抠出来的 gachaId 是个污染名，直接查表必然落空。
+--
+-- Python 侧的做法是认不出来就回退到 Gacha_Base（rrcp_server.gacha_params +
+-- build_gacha_response），能抽但池子是错的。这里做得更好一点：先用请求体里
+-- **最长的干净片段**（只含字母数字下划线）去表里做"后缀反查"，
+-- 因为污染通常只吃掉名字中间几个字母，后缀是完整的。上例中
+-- "_DoubleUp_ZhangY_BaiJ_1" 唯一命中 Gacha_DoubleUp_ZhangY_BaiJ_1，
+-- 于是能抽到玩家真正点的那个池；反查失败才回退 Gacha_Base。
+local function find_gacha(raw, g)
+    -- 返回卡池**裸名**（不带 |10 后缀）；实在认不出返回 'Gacha_Base'
+    if type(g) ~= 'table' then
+        return 'Gacha_Base'
+    end
+
+    -- 1) 请求体里直接就有完整池名
+    if raw then
+        local k = find_keyed(raw, g)
+        if k then
+            return (string.gsub(k, '|10$', ''))
+        end
+    end
+
+    -- 2) 最长干净片段做"后缀反查"
+    if raw then
+        local best
+        for tok in string.gmatch(raw, '[A-Za-z_][A-Za-z0-9_]*') do
+            if not best or #tok > #best then
+                best = tok
+            end
+        end
+        -- 门槛 8：'gachaId'/'isTen' 这种键名片段太短，会误命中
+        if best and #best >= 8 then
+            local hit
+            for key in pairs(g) do
+                local bare = string.gsub(key, '|10$', '')
+                if string.sub(bare, -#best) == best
+                        and (not hit or #bare < #hit) then
+                    hit = bare
+                end
+            end
+            if hit then
+                return hit
+            end
+        end
+    end
+
+    -- 3) 与 Python 一致地回退基础池
+    return 'Gacha_Base'
+end
+
+-- 把预编码的英雄片段拼成数组，替换掉应答里的 __YQLR_TEAM__ 占位符。
+-- 这里是"拼预编码片段"，不是"重新编码 JSON" —— 应答体里那 5 处空数组
+-- [] 必须原样保留，cjson 往返会把它们变成 {}（见文件头）。
+local function apply_team(body, stage)
+    local tpl, ph = _state.hero_tpl, _state.team_ph
+    if type(tpl) ~= 'table' or type(ph) ~= 'string' then
+        return body
+    end
+
+    -- 用哪一队：请求体里抠到的优先，否则用落盘的，再否则用构建期默认
+    local slots = _state.req_slots
+    local ids, given = {}, {}
+    for _, s in ipairs(slots or {}) do
+        ids[#ids + 1] = s.heroId
+        given[s.heroId] = s
+    end
+    if #ids == 0 and _state.team then
+        for _, h in ipairs(_state.team) do
+            ids[#ids + 1] = h
+        end
+    end
+    if #ids == 0 then
+        ids = _state.default_team or {}
+    end
+    if #ids == 0 then
+        return body
+    end
+
+    local cap = _state.team_cap or 5
+    while #ids > cap do
+        ids[#ids] = nil
+    end
+
+    -- 【不足要补齐】请求里第 2 个以后的队员是紧凑打包的（实测 C01S04 第二成员
+    -- 键是 "La6\x3f..." 而不是英雄 id），所以常常只能解出 1 个。
+    -- 绝不能因此只派一个人上场 —— 用户实测就是"只会上一个角色"。
+    -- 补位规则照抄 rrcp_server.gen_battle_data:3254-3281：
+    --   先用"已拥有里非默认"的英雄补，一个都没有才退回服务端编队。
+    --   不能拿默认那对来凑 —— 玩家看到的就是"一个默认一个我选的"。
+    if #ids < cap then
+        local def = {}
+        for _, h in ipairs(_state.default_hero_ids or {}) do
+            def[h] = true
+        end
+        local spare = {}
+        for _, h in ipairs(_state.hero_ids or {}) do
+            if not given[h] and not def[h] then
+                spare[#spare + 1] = h
+            end
+        end
+        if #spare == 0 and _state.team then
+            for _, h in ipairs(_state.team) do
+                if not given[h] then
+                    spare[#spare + 1] = h
+                end
+            end
+        end
+        local missing = cap - #ids
+        for i = 1, math.min(missing, #spare) do
+            ids[#ids + 1] = spare[i]
+        end
+    end
+
+    -- 这一关的默认站位 "x,y;x,y;..."
+    local sp = {}
+    local raw_sp = (_state.spots or {})[stage]
+    if raw_sp then
+        for part in string.gmatch(raw_sp, '[^;]+') do
+            local a, b = string.match(part, '^(%-?%d+),(%-?%d+)$')
+            if a then
+                sp[#sp + 1] = { x = tonumber(a), y = tonumber(b) }
+            end
+        end
+    end
+
+    local attr = (_state.attrs or {})[stage] or '{}'
+    -- 压地形的格子（MapDataId.landformSP）。玩家在编队界面能摆哪就摆哪，
+    -- 不保证不压地形；Python 侧校验后回退到默认站位，Lua 必须一样 ——
+    -- 压在���形上，那个地形技能会拿到 nil 的 target 直接崩
+    -- （SpecialTerrain_XinShouHuiNeng0_4_2.lua:174/176）。
+    local blocked = {}
+    for c in string.gmatch((_state.terrain or {})[stage] or '', '[^;]+') do
+        blocked[c] = true
+    end
+
+    local parts = {}
+    local combat = 0
+    for i, cid in ipairs(ids) do
+        local frag = tpl[cid .. '#' .. i]
+        if frag then
+            local x, y
+            local g = given[cid]
+            if g and g.x and g.y and not blocked[g.x .. ',' .. g.y] then
+                x, y = g.x, g.y
+            elseif sp[i] then
+                x, y = sp[i].x, sp[i].y
+            else
+                x, y = 1, 1 + i
+            end
+            -- x/y/attrs 在片段里都是**裸 token**（json 中不带引号），
+            -- 所以按字面量替换，不加引号。占位符只由 build_lua_table.py
+            -- 生成，形如 __YQLR_X__，只含字母和下划线，不是模式的魔法字符。
+            -- 用函数式替换避开替换串里 % 的转义问题。
+            frag = string.gsub(frag, _state.x_ph, function ()
+                return tostring(x)
+            end, 1)
+            frag = string.gsub(frag, _state.y_ph, function ()
+                return tostring(y)
+            end, 1)
+            frag = string.gsub(frag, _state.attr_ph, function ()
+                return attr
+            end, 1)
+            parts[#parts + 1] = frag
+            combat = combat + (_state.hero_combat or 0)
+        end
+    end
+    if #parts == 0 then
+        return body
+    end
+
+    -- friendCombat 是这一关友军的战功和（构建期算好）
+    local fc = tonumber((_state.tcb or {})[stage]) or 0
+    body = string.gsub(body, '"' .. ph .. '_TC"', function ()
+        return tostring(combat + fc)
+    end, 1)
+    -- 只换引号里的哨兵，外层的 [ ] 保留
+    return (string.gsub(body, '"' .. ph .. '"', function ()
+        return table.concat(parts, ',')
+    end, 1))
+end
+
 local function load_opcode_table()
     if type(OPCODE_TABLE) ~= 'table' then
         slog('opcode table missing (neither injected nor requirable)')
@@ -825,13 +1373,65 @@ local function load_opcode_table()
     _state.guidePlaceholder = t.guidePlaceholder
     _state.serverTimeTarget = t.serverTimeTarget
     _state.codeVersion = t.codeVersion
+    _state.main_hero_ph = t.mainHeroPlaceholder
+    _state.main_type_ph = t.mainTypePlaceholder
+    _state.main_default = t.mainScreenDefault
+    _state.debug_toggles = t.debugToggles
+    -- 按关卡/卡池预编码的整份应答。Lua 只做"抠 id -> 查表"，不碰 JSON。
+    _state.battles = t.battles
+    _state.campaign_progress = t.campaignProgress
+    _state.gacha = t.gacha
+    -- 编队片段：heroTpl["<cid>#<slot>"] 里 x/y/uid/attrs 是占位符
+    _state.hero_tpl = t.heroTpl
+    _state.spots = t.spots
+    _state.attrs = t.attrs
+    _state.tcb = t.tcb
+    _state.terrain = t.terrain
+    _state.default_team = t.defaultTeam
+    _state.hero_combat = t.heroCombat
+    _state.team_ph = t.teamPh
+    _state.x_ph = t.xPh
+    _state.y_ph = t.yPh
+    _state.uid_ph = t.uidPh
+    _state.attr_ph = t.attrPh
+    _state.hero_ids = t.heroIds
+    _state.default_hero_ids = t.defaultHeroIds
+    _state.team_cap = t.teamCap
+    _state.team_not_hero = t.teamNotHero
+    -- 关卡进度持久化：campaign_cd_ph 是 10001 里 CampaignData 的哨兵，
+    -- campaign_cd[stage] 是对应关卡的片段，两者都齐了才能在 10001 里拼接。
+    _state.campaign_cd = t.campaignCD
+    _state.campaign_cd_ph = t.campaignCDPh
+    _state.campaign_cd_default = t.campaignCDDefault
+    _state.campaign_order = t.campaignOrder
+    load_main_screen()
+    load_team()
+    -- 必须在 campaign_cd 赋值**之后**才能 load：它要校验落盘的关卡还在表里。
+    load_campaign_state()
 
     local n = 0
     for _ in pairs(_state.ops) do
         n = n + 1
     end
+
+    local function cnt(m)
+        local c = 0
+        if type(m) == 'table' then
+            for _ in pairs(m) do
+                c = c + 1
+            end
+        end
+        return c
+    end
+
     slog('opcode table loaded: %d entries, guideData=%s, serverTime=%s',
          n, tostring(_state.guideDataJson), tostring(_state.serverTimeTarget))
+    slog('materialized: battles=%d campaignProgress=%d gacha=%d heroTpl=%d',
+         cnt(_state.battles), cnt(_state.campaign_progress), cnt(_state.gacha),
+         cnt(_state.hero_tpl))
+    slog('campaign state: saved=%s default=%s cd=%d order=%d',
+         tostring(_state.saved_stage), tostring(_state.campaign_cd_default),
+         cnt(_state.campaign_cd), cnt(_state.campaign_order))
     return true
 end
 
@@ -899,7 +1499,60 @@ function build_response(req)
     end
 
     local key = tostring(req.opcode)
-    local body = _state.ops[key] or _state.ops['default']
+
+    -- [10032] 调试面板指令。离线侧只能如实回答：应答体是构建期预编码的
+    -- 字符串，改开关需要重跑 Python 侧的 apply_*()（要读 TSV），
+    -- 这里做不到。明确报错好过静默走 default 空应答让人以为改了。
+    if req.opcode == 10032 then
+        local n = 0
+
+        if _state.debug_toggles then
+            for _ in pairs(_state.debug_toggles) do
+                n = n + 1
+            end
+        end
+
+        body = '{"resCode":1,"data":"离线构建不支持在线改服务端配置'
+            .. '（应答体是构建期预编码的，改开关要重跑 apply_*）。'
+            .. '可用开关 ' .. n .. ' 个：请用 Python mock，或改配置后重新构建。"}'
+    -- [10038] changeHero = 设置主屏助理。
+    -- 客户端只检查 resCode，真正生效靠应答里的 d.player 被
+    -- Service.lua:71-77 派发成 EVT_SYNCHRONIZE_DIFF ->
+    -- DevelopSystem:syncPlayer -> BasePlayer:synchronizeInfoDiff(:224-230)。
+    -- 不回这个 diff，_mainScreenHeroId 就不变，于是"换了助理但语音还是上一个"。
+    elseif req.opcode == 10038 then
+        local raw = req.body or ''
+        -- string.match，不是 find：find 给的是整个匹配的起止位置，
+        -- string.sub(a+1, b) 会把 `"heroId":` 一起截进来。
+        local function grab(name)
+            return string.match(raw, '"' .. name .. '"%s*:%s*"([^"]*)"')
+        end
+
+        local hero = grab('heroId')
+        local typ = grab('resourceType')
+
+        -- resourceType 合法值只有 L2D / Por_Spine / Illustration
+        -- （SelectPanelWidget.lua:10-12），其余沿用当前形态。
+        local VALID = { L2D = true, Por_Spine = true, Illustration = true }
+
+        if hero and hero ~= '' then
+            if not typ or not VALID[typ] then
+                typ = _state.main_type or 'Por_Spine'
+            end
+
+            _state.main_hero = hero
+            _state.main_type = typ
+            save_main_screen()
+            slog('10038 changeHero -> %s / %s', tostring(hero), tostring(typ))
+        end
+
+        body = '{"resCode":0,"data":{},"d":{"player":{'
+            .. '"mainScreenHeroId":"' .. tostring(_state.main_hero or '') .. '",'
+            .. '"mainScreenType":"' .. tostring(_state.main_type or '') .. '"}}}'
+    else
+        body = _state.ops[key] or _state.ops['default']
+    end
+
     if not body then
         body = '{"resCode":0,"data":{}}'
     end
@@ -922,6 +1575,182 @@ function build_response(req)
             body = rep
         else
             slog('10001 里找不到占位符 %s，guideData 未下发', ph)
+        end
+    end
+
+    -- [14002 / 21001 / 21005] 主线战斗 / 天梯战斗 / 天梯扫荡。
+    --
+    -- 构建期已按关卡把**整份应答**算好存进 OPCODE_TABLE.battles
+    -- （1889 条 = 主线 203 + 天梯 1686）。Lua 侧只做"抠关卡号 -> 查表"，
+    -- 不解码也不重编码：应答体里有空数组 []，cjson 往返会把它们变成 {}
+    -- （reward / clubList 等会踩雷），所以整段只能原样发出。
+    --
+    -- 为什么不用占位符换 id：占位符只能换字符串字段，换不了整个 data。
+    -- 敌人组成、站位、技能逐关不同（实测每关约 2.5 KB），全量 4.8 MB；
+    -- 相对 1.7 GB 的 APK 可忽略，换来的是"每关敌方都正确"。
+    if req.opcode == 14002 or req.opcode == 21001 or req.opcode == 21005 then
+        local raw = req.body or ''
+        local stage, hit = find_keyed(raw, _state.battles)
+        if hit then
+            -- 记住本次打的关卡：14003 的请求体里没有 campaignId（只有 15 B），
+            -- 结算时只能靠这个 _state.last_stage 兜底。
+            _state.last_stage = stage
+            _state.req_slots = scan_team(raw)
+            body = apply_team(hit, stage)
+            local picked = {}
+            for _, s in ipairs(_state.req_slots or {}) do
+                picked[#picked + 1] = s.heroId
+            end
+            slog('%d 关卡 %s 命中预编码应答，我方编队 %s', req.opcode,
+                 tostring(stage), table.concat(picked, ','))
+        else
+            slog('%d 请求里没解出关卡号，走静态兜底', req.opcode)
+        end
+    end
+
+    -- [14003] 主线结算。
+    --
+    -- ⚠️ 关键：**14003 的请求体里没有 campaignId**（实测只有 15 B，
+    -- 见 MEMORY 3017-3021）。Python 侧靠
+    --     camp = self.extract_campaign(body) or self.last_campaign
+    -- 记住"上一包 14002 打的是哪关"来兜底；离线端早期版本只从 body 里找，
+    -- 15 B 的 body 根本没有关卡号 -> 查表落空 -> 走静态兜底 ->
+    -- lastPassed 不推进 -> **关卡打过了但下一关不解锁**。
+    -- 所以这里必须用 _state.last_stage（由 14002/21001/21005 写入）兜底。
+    --
+    -- 另外 campaignProgress 是构建期按"一路打上来"穷举的，
+    -- 比在 Lua 里拼 CampaignData 稳得多（branchLastPassed 是嵌套 map，
+    -- gsub 换不了）。
+    if req.opcode == 14003 and _state.campaign_progress then
+        local cid, hit = find_keyed(req.body or '', _state.campaign_progress)
+        if not hit then
+            cid = _state.last_stage
+            hit = cid and _state.campaign_progress[cid] or nil
+            if hit then
+                slog('14003 请求体里无关卡号，用上一包 14002 的 %s 兜底', tostring(cid))
+            end
+        end
+        if hit then
+            body = hit
+            slog('14003 关卡 %s 命中预编码结算应答', tostring(cid))
+            -- 只在"确实更远了"时落盘。玩家打到 C03S05 后回头重打一关 C01S02，
+            -- 如果无条件覆盖，下次启动进度就退回 C01S02 了。
+            --
+            -- 注意比的是 saved_stage 而不是 last_stage：last_stage 刚被上一包
+            -- 14002 设成本次打的关，拿它比自己跟自己比，结果永远是"没变远"。
+            if cid and campaign_farther(cid, _state.saved_stage) then
+                _state.saved_stage = cid
+                save_campaign_state()
+            end
+        else
+            slog('14003 没解出关卡号（last_stage=%s），走静态兜底',
+                 tostring(_state.last_stage))
+        end
+    end
+
+    -- [15001] 抽卡。构建期每个卡池跑过单抽和十连，各存一份。
+    -- 离线端没有随机源，固定结果反而更合脚：同一个池反复十连结果一样。
+    if req.opcode == 15001 and _state.gacha then
+        local raw = req.body or ''
+        -- isTen 只决定取单抽还是十连那份。实测它后面也可能跟坏字节，
+        -- 所以用 '[^%w]+' 容忍分隔，而不是写死 '"isTen":'。
+        local is_ten = string.match(raw, '"isTen"[^%w]+true') ~= nil
+        local name = find_gacha(raw, _state.gacha)
+        local key = is_ten and (name .. '|10') or name
+        local hit = _state.gacha[key]
+        if not hit then
+            -- 表里只有一种时互相兜一下
+            local alt = is_ten and name or (name .. '|10')
+            if _state.gacha[alt] then
+                key, hit, is_ten = alt, _state.gacha[alt], not is_ten
+            end
+        end
+        if hit then
+            body = hit
+            slog('15001 卡池 %s%s 命中预编码应答', tostring(name),
+                 is_ten and ' 十连' or '')
+        else
+            slog('15001 卡池 %s 键 %s 未命中，走静态兜底', tostring(name),
+                 tostring(key))
+        end
+    end
+
+    -- [29001] 改编队。
+    --
+    -- 客户端实际上不发这个 opcode —— 编队是随 14002 的请求体一起过来的
+    -- （实测 C01S02 的 body 里就有 teams 段）。这里仍按能收到来解析并存盘，
+    -- 让离线端与 Python 侧的 team_state.json 保持同一份数据。
+    if req.opcode == 29001 then
+        local slots = scan_team(req.body or '')
+        local ids = {}
+        for _, s in ipairs(slots) do
+            ids[#ids + 1] = s.heroId
+        end
+        if #ids > 0 then
+            save_team(ids)
+        end
+        slog('29001 编队 %s', table.concat(ids, ','))
+    end
+
+    -- 10001 的主屏助理：占位符换成落盘状态。
+    -- 这两个是标量字符串字段，gsub 替换是安全的（不需要重新编码整段 JSON）。
+    if req.opcode == 10001 and _state.main_hero_ph then
+        local function sub1(s, ph, val)
+            local phq = '"' .. ph .. '"'
+            local vq = '"' .. tostring(val or '') .. '"'
+            local a, b = string.find(s, phq, 1, true)
+
+            if not a then
+                return s
+            end
+
+            return string.sub(s, 1, a - 1) .. vq .. string.sub(s, b + 1)
+        end
+
+        body = sub1(body, _state.main_hero_ph, _state.main_hero)
+        body = sub1(body, _state.main_type_ph, _state.main_type)
+    end
+
+    -- 10001 的关卡进度：把构建期埋的哨兵换成本次要下发的 CampaignData。
+    --
+    -- 这一步**不能省**，而且**必须有兜底**。
+    --  · 不能省：客户端每次冷启动先收 10001，进度是从这里读的；只在 14003
+    --    落盘的话，重进游戏时 10001 照样把进度打回构建时的初值。
+    --  · 要兜底：哨兵是个**字符串**，而 CampaignData 必须是**对象**。
+    --    没有落盘（新装/清数据）时如果直接跳过替换，客户端就会拿到
+    --    "CampaignData":"__YQLR_CD__"，进主线就炸。所以拿初值快照兜底，
+    --    语义上等于"全新玩家"，和 Python 侧冷启动一致。
+    --
+    -- 替换的是整个值（哨兵是个字符串），不是逐字段改 —— 所以 Lua 不需要知道
+    -- 原对象的字节范围，也不重新编码任何 JSON（campaignCD 是构建期编码好的片段）。
+    if req.opcode == 10001 and _state.campaign_cd_ph then
+        local stage = _state.saved_stage or _state.campaign_cd_default
+        local cd = stage and _state.campaign_cd and _state.campaign_cd[stage]
+
+        if cd then
+            local phq = '"CampaignData":"' .. _state.campaign_cd_ph .. '"'
+            local a, b = string.find(body, phq, 1, true)
+
+            if a then
+                body = string.sub(body, 1, a - 1) .. '"CampaignData":' .. cd
+                      .. string.sub(body, b + 1)
+                slog('10001 CampaignData 用 %s 替换（%s）', stage,
+                     _state.saved_stage and '落盘进度' or '初值快照')
+            else
+                slog('!! 10001 里找不到 CampaignData 哨兵 %s，哨兵会发给客户端',
+                     _state.campaign_cd_ph)
+            end
+        else
+            -- 表里连初值都没有 = 构建期就出错了。宁可发一个最小合法对象，
+            -- 也绝不能让哨兵字符串流到客户端。
+            slog('!! 没有可用的 CampaignData 快照（saved=%s default=%s），下发空对象',
+                 tostring(_state.saved_stage), tostring(_state.campaign_cd_default))
+            local phq = '"CampaignData":"' .. _state.campaign_cd_ph .. '"'
+
+            if string.find(body, phq, 1, true) then
+                body = string.gsub(body, '"CampaignData":"' .. _state.campaign_cd_ph .. '"',
+                                   '"CampaignData":{}', 1)
+            end
         end
     end
 

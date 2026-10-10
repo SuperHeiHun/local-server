@@ -12,8 +12,9 @@
 ```
 python-server/   rrcp_server.py  opcodes_table.json  start_mock_detached.ps1
 lua-server/      offline_server.lua  opcode_table.lua(生成物)  build_lua_table.py
-build/           build_patched_luac.py  rebuild_v5.py  patch_runtime_db.py  test_rsp_offline.py
-docs/            MEMORY.md
+build/           build_patched_luac.py  rebuild_v5.py  patch_runtime_db.py
+                 test_rsp_offline.py  test_lua_parity.py
+docs/            MEMORY.md  LUA_BUILD.md  CAMPAIGN_PERSIST_PLAN.md
 ```
 
 客户端文件（反编译 Lua 源码、配置表、原版 APK）需自行从你持有的 APK 中提取，
@@ -74,8 +75,13 @@ cd lua-server && python build_lua_table.py
 
 ```powershell
 cd build
-python test_rsp_offline.py
+python test_rsp_offline.py     # 应答层，含关卡进度持久化回归
+python test_lua_parity.py      # Python ↔ Lua 对拍，要求零差异
 ```
+
+`LUA_BUILD.md` 记录了预编码约束、占位符清单、
+落盘状态格式和构建命令；
+`CAMPAIGN_PERSIST_PLAN.md` 是关卡进度持久化的设计与实施记录。
 
 ## 产物
 
